@@ -332,6 +332,11 @@ export default function App() {
           </section>
 
           <section className="dashboard-intro">
+            <article className="intro-panel intro-panel-summary intro-panel-hero">
+              <span>Project snapshot</span>
+              <strong>Scan sites, track issues, and review quality signals from one place.</strong>
+              <p>Brief overview: run checks, compare results, and open details when you need evidence.</p>
+            </article>
             <article className="intro-panel intro-panel-primary">
               <span>Operating model</span>
               <strong>Run scans, watch the health signal, and inspect evidence from one place.</strong>

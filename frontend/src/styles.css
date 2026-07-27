@@ -474,9 +474,21 @@ button:hover {
 
 .dashboard-intro {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 14px;
+}
+
+.intro-panel-summary {
+  border-color: rgba(122, 162, 247, 0.22);
+  background:
+    radial-gradient(circle at top right, rgba(122, 162, 247, 0.12), transparent 24%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.02));
+}
+
+.intro-panel-hero {
+  grid-column: 1 / -1;
+  min-height: 0;
 }
 
 .intro-panel {
@@ -485,6 +497,7 @@ button:hover {
   border: 1px solid var(--panel-border);
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.18);
+  min-height: 122px;
 }
 
 .intro-panel-primary {
@@ -1192,6 +1205,10 @@ select option {
   .scan-hero-band,
   .detail-grid-two {
     grid-template-columns: 1fr;
+  }
+
+  .intro-panel-hero {
+    grid-column: auto;
   }
 
   .hero {
