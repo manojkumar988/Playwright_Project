@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 type Project = {
   id: number
@@ -51,10 +51,89 @@ type ScanDetail = Scan & {
 
 type LiveEvent =
   | { type: 'log'; message: string }
-  | { type: 'done'; report?: string }
+  | { type: 'done'; report?: string; scan_id?: number }
+  | { type: 'stopped'; message: string; report?: string; scan_id?: number }
   | { type: 'error'; message: string }
 
-const API_BASE = 'http://127.0.0.1:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
+
+const classifyLiveLog = (message: string) => {
+  const normalized = message.toLowerCase()
+  if (normalized.includes('error') || normalized.includes('failed') || normalized.includes('broken')) return { kind: 'error', label: 'Issue', icon: '!' }
+  if (normalized.includes('complete') || normalized.includes('ready') || normalized.includes('finished')) return { kind: 'success', label: 'Done', icon: '✓' }
+  if (normalized.includes('queue') || normalized.includes('discover')) return { kind: 'discovery', label: 'Discover', icon: '◇' }
+  if (normalized.includes('click') || normalized.includes('scroll') || normalized.includes('action')) return { kind: 'action', label: 'Action', icon: '↗' }
+  if (normalized.includes('page') || normalized.includes('visit') || normalized.includes('fetch')) return { kind: 'navigation', label: 'Navigate', icon: '◎' }
+  return { kind: 'info', label: 'Info', icon: '·' }
+}
+
+type CompletedScoreGroup = { label: string; score: number; deductions: string[] }
+type CompletedFinding = { severity: string; message: string }
+
+const parseCompletedReport = (raw: string) => {
+  const lines = raw.split(/\r?\n/)
+  const exactValue = (label: string) => lines.find((line) => line.startsWith(`${label}:`))?.slice(label.length + 1).trim() ?? ''
+  const exactNumber = (label: string) => Number.parseInt(exactValue(label), 10) || 0
+  const section = (heading: string, stops: string[]) => {
+    const start = lines.indexOf(heading)
+    if (start < 0) return []
+    const output: string[] = []
+    for (let index = start + 1; index < lines.length; index += 1) {
+      if (stops.some((stop) => lines[index].startsWith(stop))) break
+      output.push(lines[index])
+    }
+    return output
+  }
+
+  const scoreLines = section('Score Breakdown:', ['Overall Score Formula:', 'Executive Summary:', 'Site Score:'])
+  const scoreBreakdown: CompletedScoreGroup[] = []
+  for (const line of scoreLines) {
+    const scoreMatch = line.match(/^- (.+):\s*(\d+)\/100$/)
+    if (scoreMatch) {
+      scoreBreakdown.push({ label: scoreMatch[1], score: Number(scoreMatch[2]), deductions: [] })
+    } else if (line.trim() && scoreBreakdown.length) {
+      scoreBreakdown[scoreBreakdown.length - 1].deductions.push(line.trim().replace(/^-\s*/, ''))
+    }
+  }
+
+  const testedPages = section('Tested Pages:', ['Clicked Links:', 'Page Summaries:', 'Crawl Graph:', 'Phase 2 Summary:'])
+    .filter((line) => line.startsWith('- '))
+    .map((line) => line.slice(2).trim())
+  const executiveSummary = section('Executive Summary:', ['Site Score:'])
+    .filter((line) => line.startsWith('- '))
+    .map((line) => line.slice(2).trim())
+  const findings: CompletedFinding[] = section('Findings:', [])
+    .filter((line) => line.startsWith('- ['))
+    .map((line) => {
+      const match = line.match(/^- \[([^\]]+)\]\s*(.*)$/)
+      return { severity: match?.[1] ?? 'Info', message: match?.[2] ?? line.slice(2) }
+    })
+
+  return {
+    targetUrl: exactValue('Target URL'),
+    pagesTested: exactNumber('Pages Tested'),
+    siteScore: Number.parseInt(exactValue('Site Score'), 10) || 0,
+    riskLevel: exactValue('Risk Level') || 'Unknown',
+    totalFindings: exactNumber('Total Findings'),
+    uniqueFindings: exactNumber('Unique Findings'),
+    brokenLinks: exactNumber('Broken Links'),
+    jsErrors: exactNumber('JS Errors'),
+    apiFailures: exactNumber('API Failures'),
+    resourceFailures: exactNumber('Resource Failures'),
+    navigationFailures: exactNumber('Navigation Failures'),
+    slowPages: exactNumber('Slow Pages Unique'),
+    testedPages,
+    executiveSummary,
+    scoreBreakdown,
+    findings,
+  }
+}
+
+const formatProjectDate = (value: string) => {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(date)
+}
 
 export default function App() {
   const [url, setUrl] = useState('')
@@ -67,7 +146,9 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [liveLogs, setLiveLogs] = useState<string[]>([])
+  const liveLogRef = useRef<HTMLUListElement | null>(null)
   const [livePhase, setLivePhase] = useState('Idle')
+  const [liveOutcome, setLiveOutcome] = useState<'idle' | 'running' | 'completed' | 'stopped' | 'error'>('idle')
   const [liveStartedAt, setLiveStartedAt] = useState<number | null>(null)
   const [liveTick, setLiveTick] = useState(0)
   const [scanLoading, setScanLoading] = useState(false)
@@ -111,12 +192,19 @@ export default function App() {
     return () => window.clearInterval(timer)
   }, [loading])
 
+  useEffect(() => {
+    const consoleElement = liveLogRef.current
+    if (!consoleElement || liveLogs.length === 0) return
+    consoleElement.scrollTo({ top: consoleElement.scrollHeight, behavior: 'smooth' })
+  }, [liveLogs])
+
   const runScan = async () => {
     setLoading(true)
     setError('')
     setReport('')
     setLiveLogs([])
     setLivePhase('Starting')
+    setLiveOutcome('running')
     setLiveStartedAt(Date.now())
     try {
       const response = await fetch(`${API_BASE}/scan/live`, {
@@ -149,14 +237,21 @@ export default function App() {
           } else if (payload.type === 'done') {
             setReport(payload.report ?? '')
             setLivePhase('Completed')
+            setLiveOutcome('completed')
+          } else if (payload.type === 'stopped') {
+            setReport(payload.report ?? '')
+            setLivePhase(payload.message)
+            setLiveOutcome('stopped')
           } else if (payload.type === 'error') {
             setLivePhase('Error')
+            setLiveOutcome('error')
             throw new Error(payload.message)
           }
         }
       }
       await loadData()
     } catch (err) {
+      setLiveOutcome('error')
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setLoading(false)
@@ -181,9 +276,11 @@ export default function App() {
   const formatElapsed = (seconds: number) => {
     if (seconds < 60) return `${seconds}s`
     const minutes = Math.floor(seconds / 60)
-    if (seconds < 3600) return `${minutes}m`
+    const remainingSeconds = seconds % 60
+    if (seconds < 3600) return `${minutes}m ${String(remainingSeconds).padStart(2, '0')}s`
     const hours = Math.floor(seconds / 3600)
-    return `${hours}h`
+    const remainingMinutes = Math.floor((seconds % 3600) / 60)
+    return `${hours}h ${String(remainingMinutes).padStart(2, '0')}m ${String(remainingSeconds).padStart(2, '0')}s`
   }
   const liveBars = [
     38, 62, 48, 84, 56, 72, 44, 90, 58, 76, 52, 68,
@@ -192,6 +289,9 @@ export default function App() {
     delay: `${index * 90}ms`,
   }))
 
+  const completedResult = report ? parseCompletedReport(report) : null
+  const completedTarget = completedResult?.targetUrl.replace(/\/$/, '') ?? ''
+  const completedScan = report ? [...scans].reverse().find((scan) => scan.url.replace(/\/$/, '') === completedTarget) ?? scans[scans.length - 1] ?? null : null
   const openScan = (id: number) => {
     window.location.hash = `scan/${id}`
   }
@@ -228,7 +328,11 @@ export default function App() {
   const totalFindings = scans.reduce((total, scan) => total + scan.total_findings, 0)
   const selectedProject = view.kind === 'project' ? projects.find((project) => project.id === view.id) ?? null : null
   const projectScans = selectedProject ? scans.filter((scan) => scan.project_id === selectedProject.id) : []
-  const latestScan = scans[0] ?? null
+  const projectLatestScan = projectScans[projectScans.length - 1] ?? null
+  const projectAverageScore = projectScans.length ? Math.round(projectScans.reduce((total, scan) => total + scan.site_score, 0) / projectScans.length) : 0
+  const projectTotalFindings = projectScans.reduce((total, scan) => total + scan.total_findings, 0)
+  const projectDisplayName = selectedProject ? selectedProject.name.replace(/^https?:\/\//, '').replace(/\/$/, '') : ''
+  const latestScan = scans[scans.length - 1] ?? null
   const passingScans = scans.filter((scan) => scan.site_score >= 90).length
   const warningScans = scans.filter((scan) => scan.site_score < 90 && scan.site_score >= 70).length
   const needsAttentionScans = scans.filter((scan) => scan.site_score < 70).length
@@ -260,9 +364,14 @@ export default function App() {
         <div className="home-layout">
           <aside className="home-sidebar">
             <div className="sidebar-brand">
-              <p className="eyebrow">Autonomous QA</p>
-              <h2>Control Room</h2>
-              <p>Live navigation and system context.</p>
+              <div className="brand-lockup">
+                <span className="brand-mark" aria-hidden="true"><i /></span>
+                <div>
+                  <p className="eyebrow">Autonomous QA</p>
+                  <h2>Control Room</h2>
+                </div>
+              </div>
+              <p>Your quality command center.</p>
             </div>
             <div className="sidebar-status">
               <div className="sidebar-status-top">
@@ -275,12 +384,12 @@ export default function App() {
               <small>{API_BASE}</small>
             </div>
             <nav className="sidebar-nav">
-              <button type="button" className="sidebar-link sidebar-link-active">Overview</button>
-              <button type="button" className="sidebar-link" onClick={() => openProject(projects[0]?.id ?? 0)} disabled={!projects.length}>
-                Project
+              <button type="button" className="sidebar-link sidebar-link-active"><span aria-hidden="true">◈</span>Overview</button>
+              <button type="button" className="sidebar-link" onClick={() => openProject(projects[projects.length - 1]?.id ?? 0)} disabled={!projects.length}>
+                <span aria-hidden="true">◇</span>Projects
               </button>
-              <button type="button" className="sidebar-link" onClick={() => openScan(scans[0]?.id ?? 0)} disabled={!scans.length}>
-                Scan
+              <button type="button" className="sidebar-link" onClick={() => openScan(scans[scans.length - 1]?.id ?? 0)} disabled={!scans.length}>
+                <span aria-hidden="true">↗</span>Scans
               </button>
             </nav>
             <div className="sidebar-stats">
@@ -308,6 +417,20 @@ export default function App() {
           </aside>
 
           <main className="home-content">
+          <header className="dashboard-header">
+            <div>
+              <p className="eyebrow">Quality overview</p>
+              <h1>Everything looks better when quality is visible.</h1>
+              <p>Monitor site health, launch intelligent scans, and turn every finding into a clear next step.</p>
+            </div>
+            <div className={`system-chip ${loading ? 'system-chip-live' : ''}`}>
+              <span className="system-chip-dot" />
+              <div>
+                <small>System status</small>
+                <strong>{loading ? 'Scan running' : 'All systems operational'}</strong>
+              </div>
+            </div>
+          </header>
           <section className="overview-strip">
             <article className="overview-card overview-card-accent">
               <span>Latest score</span>
@@ -333,25 +456,29 @@ export default function App() {
 
           <section className="dashboard-intro">
             <article className="intro-panel intro-panel-summary intro-panel-hero">
-              <span>Project snapshot</span>
-              <strong>Scan sites, track issues, and review quality signals from one place.</strong>
-              <p>Brief overview: run checks, compare results, and open details when you need evidence.</p>
+              <div className="hero-orbit" aria-hidden="true"><span /><i /></div>
+              <div className="intro-copy">
+                <span>Project snapshot</span>
+                <strong>Ship experiences people can trust.</strong>
+                <p>Scan every journey, surface meaningful risks, and keep your release quality moving in the right direction.</p>
+              </div>
             </article>
-            <article className="intro-panel intro-panel-primary">
-              <span>Operating model</span>
-              <strong>Run scans, watch the health signal, and inspect evidence from one place.</strong>
-              <p>Use the scan runner first, then open any project or scan row to move from overview to detail in one click.</p>
-            </article>
-            <article className="intro-panel">
-              <span>Reading order</span>
-              <strong>Signals up top, evidence below.</strong>
-              <p>The dashboard emphasizes score, risk, and deltas before you reach the raw findings and artifacts.</p>
+            <article className="intro-panel intro-panel-primary signal-panel">
+              <span>Quality pulse</span>
+              <div className="signal-row"><i className="signal-good" /><div><strong>{passingScans} passing</strong><small>Healthy experiences</small></div></div>
+              <div className="signal-row"><i className="signal-warn" /><div><strong>{warningScans} warnings</strong><small>Worth reviewing</small></div></div>
+              <div className="signal-row"><i className="signal-alert" /><div><strong>{needsAttentionScans} at risk</strong><small>Needs attention</small></div></div>
             </article>
           </section>
 
-          <section className="panel">
+          <section className="panel scan-runner">
             <div className="panel-header">
-              <h2>Run Scan</h2>
+              <div>
+                <p className="eyebrow">New assessment</p>
+                <h2>Run a website scan</h2>
+                <small>Choose a target and let the quality engine do the rest.</small>
+              </div>
+              <span className="runner-badge">AI-assisted</span>
             </div>
             <div className="form-grid">
               <label>
@@ -386,24 +513,150 @@ export default function App() {
                 ) : null}
               </div>
             </div>
-            {error ? <p className="error">{error}</p> : null}
-            {liveLogs.length ? (
-              <div className="live-log-panel">
-                <div className="panel-header compact">
-                  <h3>Live activity</h3>
-                  <span>{liveLogs.length} updates</span>
+            {error ? <p className="error" role="alert">{error}</p> : null}
+            {(loading || liveLogs.length > 0 || liveOutcome !== 'idle') ? (
+              <section className={`live-console live-console-${liveOutcome}`}>
+                <header className="live-console-header">
+                  <div className="live-console-title">
+                    <span className="console-window-dots" aria-hidden="true"><i /><i /><i /></span>
+                    <div>
+                      <p className="eyebrow">Realtime scanner</p>
+                      <h3>Live activity console</h3>
+                    </div>
+                  </div>
+                  <span className="live-console-state" aria-live="polite"><i />{liveOutcome === 'running' ? 'Scanning' : liveOutcome === 'stopped' ? 'Stopped' : liveOutcome === 'error' ? 'Interrupted' : 'Complete'}</span>
+                </header>
+
+                <div className="live-console-overview">
+                  <div className="live-console-phase">
+                    <span>Current operation</span>
+                    <strong>{livePhase}</strong>
+                  </div>
+                  <div className="live-console-stat">
+                    <span>Elapsed</span>
+                    <strong>{formatElapsed(liveElapsedSeconds)}</strong>
+                  </div>
+                  <div className="live-console-stat">
+                    <span>Events</span>
+                    <strong>{liveLogs.length}</strong>
+                  </div>
+                  <div className="live-console-waveform" aria-label={loading ? 'Scan activity is live' : 'Scan activity stopped'}>
+                    {liveBars.map((bar, index) => <i key={index} className={loading ? 'is-active' : ''} style={{ height: bar.height, animationDelay: bar.delay }} />)}
+                  </div>
                 </div>
-                <ul className="live-log-list">
-                  {liveLogs.map((line, index) => (
-                    <li key={`${index}-${line}`} className="live-log-item">
-                      <span className="live-dot" />
-                      <span>{line}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
+
+                <div className="live-console-terminal">
+                  <div className="live-console-toolbar">
+                    <span><i className="console-online-dot" />Event stream</span>
+                    <span>Auto-scroll enabled</span>
+                  </div>
+                  <ul className="live-console-lines" ref={liveLogRef}>
+                    {liveLogs.length ? liveLogs.map((line, index) => {
+                      const event = classifyLiveLog(line)
+                      return (
+                        <li key={`${index}-${line}`} className={`live-console-line log-${event.kind}`}>
+                          <span className="console-line-number">{String(index + 1).padStart(2, '0')}</span>
+                          <span className="console-event-icon" aria-hidden="true">{event.icon}</span>
+                          <span className="console-line-message">{line}</span>
+                          <span className="console-event-label">{event.label}</span>
+                        </li>
+                      )
+                    }) : (
+                      <li className="live-console-empty"><span className="console-loader" /><span>Preparing the scanner and waiting for the first event…</span></li>
+                    )}
+                  </ul>
+                </div>
+
+                <footer className="live-console-footer">
+                  <span><i />{url || 'Waiting for a target URL'}</span>
+                  <span>{mode} · {headless ? 'headless' : 'visible browser'}</span>
+                </footer>
+              </section>
             ) : null}
-            {report ? <pre className="report">{report}</pre> : null}
+            {completedResult ? (
+              <section className={`completed-report ${liveOutcome === 'stopped' ? 'completed-report-stopped' : ''}`}>
+                <header className="completed-report-header">
+                  <div className="completed-report-heading">
+                    <span className="completed-report-mark" aria-hidden="true">{liveOutcome === 'stopped' ? '■' : '✓'}</span>
+                    <div><p className="eyebrow">{liveOutcome === 'stopped' ? 'Assessment stopped' : 'Assessment complete'}</p><h2>{liveOutcome === 'stopped' ? 'Your partial quality report is saved' : 'Your quality report is ready'}</h2><p>{completedResult.targetUrl || url}</p></div>
+                  </div>
+                  <div className="completed-report-actions">
+                    <span className="completed-report-status"><i />{liveOutcome === 'stopped' ? 'Partial results saved' : 'Saved successfully'}</span>
+                    {completedScan ? <button onClick={() => openScan(completedScan.id)}>Open scan details <span aria-hidden="true">→</span></button> : null}
+                  </div>
+                </header>
+
+                <div className="completed-report-spotlight">
+                  <div className="completed-score-ring" style={{ background: `conic-gradient(#8b7cff ${completedResult.siteScore}%, rgba(255,255,255,.07) 0)` }}>
+                    <div><strong>{completedResult.siteScore}</strong><span>out of 100</span></div>
+                  </div>
+                  <div className="completed-score-copy">
+                    <span className={`completed-risk completed-risk-${completedResult.riskLevel.toLowerCase().replace(/[^a-z]+/g, '-')}`}>{completedResult.riskLevel} risk</span>
+                    <h3>{liveOutcome === 'stopped' ? 'Partial quality signal' : completedResult.siteScore >= 90 ? 'Excellent quality signal' : completedResult.siteScore >= 70 ? 'A solid result with room to improve' : 'This experience needs attention'}</h3>
+                    <p>{completedResult.executiveSummary[0] ?? `${completedResult.pagesTested} pages were tested and ${completedResult.totalFindings} findings were recorded.`}</p>
+                  </div>
+                  <div className="completed-report-mini-metrics">
+                    <div><span>Pages</span><strong>{completedResult.pagesTested}</strong></div>
+                    <div><span>Unique</span><strong>{completedResult.uniqueFindings}</strong></div>
+                    <div><span>Findings</span><strong>{completedResult.totalFindings}</strong></div>
+                  </div>
+                </div>
+
+                <div className="completed-report-metrics">
+                  <article><span>Broken links</span><strong>{completedResult.brokenLinks}</strong><i className={completedResult.brokenLinks ? 'metric-alert' : 'metric-good'} /></article>
+                  <article><span>JavaScript errors</span><strong>{completedResult.jsErrors}</strong><i className={completedResult.jsErrors ? 'metric-alert' : 'metric-good'} /></article>
+                  <article><span>API failures</span><strong>{completedResult.apiFailures}</strong><i className={completedResult.apiFailures ? 'metric-alert' : 'metric-good'} /></article>
+                  <article><span>Resource failures</span><strong>{completedResult.resourceFailures}</strong><i className={completedResult.resourceFailures ? 'metric-warn' : 'metric-good'} /></article>
+                  <article><span>Navigation failures</span><strong>{completedResult.navigationFailures}</strong><i className={completedResult.navigationFailures ? 'metric-alert' : 'metric-good'} /></article>
+                  <article><span>Slow pages</span><strong>{completedResult.slowPages}</strong><i className={completedResult.slowPages ? 'metric-warn' : 'metric-good'} /></article>
+                </div>
+
+                <div className="completed-report-grid">
+                  <article className="completed-report-card completed-summary-card">
+                    <div className="completed-card-heading"><div><p className="eyebrow">At a glance</p><h3>Executive summary</h3></div><span aria-hidden="true">✦</span></div>
+                    {completedResult.executiveSummary.length ? (
+                      <ul>{completedResult.executiveSummary.map((item, index) => <li key={index}><i />{item}</li>)}</ul>
+                    ) : <p className="completed-empty-copy">No executive summary was generated for this scan.</p>}
+                  </article>
+
+                  <article className="completed-report-card completed-pages-card">
+                    <div className="completed-card-heading"><div><p className="eyebrow">Coverage</p><h3>Pages tested</h3></div><span>{completedResult.testedPages.length}</span></div>
+                    {completedResult.testedPages.length ? (
+                      <ul>{completedResult.testedPages.slice(0, 6).map((pageUrl, index) => <li key={`${index}-${pageUrl}`}><span>{String(index + 1).padStart(2, '0')}</span><strong>{pageUrl}</strong></li>)}</ul>
+                    ) : <p className="completed-empty-copy">No tested-page list was included.</p>}
+                    {completedResult.testedPages.length > 6 ? <small>+{completedResult.testedPages.length - 6} additional pages available in the raw report</small> : null}
+                  </article>
+                </div>
+
+                {completedResult.scoreBreakdown.length ? (
+                  <article className="completed-report-card completed-breakdown-card">
+                    <div className="completed-card-heading"><div><p className="eyebrow">Quality dimensions</p><h3>Score breakdown</h3></div><span>{completedResult.scoreBreakdown.length} categories</span></div>
+                    <div className="completed-score-groups">
+                      {completedResult.scoreBreakdown.map((group) => (
+                        <div key={group.label} className="completed-score-group">
+                          <div><span>{group.label}</span><strong>{group.score}/100</strong></div>
+                          <span className="completed-score-track"><i style={{ width: `${group.score}%` }} /></span>
+                          {group.deductions.length ? <small>{group.deductions[0]}</small> : <small>No deductions</small>}
+                        </div>
+                      ))}
+                    </div>
+                  </article>
+                ) : null}
+
+                {completedResult.findings.length ? (
+                  <article className="completed-report-card completed-findings-card">
+                    <div className="completed-card-heading"><div><p className="eyebrow">Evidence</p><h3>Key findings</h3></div><span>{completedResult.findings.length}</span></div>
+                    <ul>{completedResult.findings.slice(0, 5).map((finding, index) => <li key={index}><span>{finding.severity}</span><strong>{finding.message}</strong></li>)}</ul>
+                    {completedResult.findings.length > 5 ? <small>+{completedResult.findings.length - 5} additional findings available in Scan Detail</small> : null}
+                  </article>
+                ) : null}
+
+                <details className="completed-raw-report">
+                  <summary><span><span className="eyebrow">Technical output</span><strong>{liveOutcome === 'stopped' ? 'Partial raw report' : 'Complete raw report'}</strong></span><span>View output <i aria-hidden="true">⌄</i></span></summary>
+                  <pre>{report}</pre>
+                </details>
+              </section>
+            ) : null}
           </section>
 
           <section className="home-grid">
@@ -450,315 +703,348 @@ export default function App() {
       ) : null}
 
       {view.kind === 'scan' ? (
-        <>
-          <header className="page-hero">
-            <div>
-              <p className="eyebrow">Scan detail</p>
-              <h1>{selectedScan ? `Scan #${selectedScan.id}` : `Scan #${view.id}`}</h1>
-              <p className="page-subtitle">{selectedScan?.url ?? 'Loading scan details...'}</p>
-              {selectedScan ? (
-                <div className="summary-pills">
-                  <span className="summary-pill summary-pill-score">Score {selectedScan.site_score}/100</span>
-                  <span className="summary-pill">{selectedScan.risk_level}</span>
-                  <span className="summary-pill">{selectedScan.pages_tested} pages</span>
-                  <span className="summary-pill">{selectedScan.unique_findings} unique findings</span>
+        <section className="scan-page">
+          <header className="scan-page-hero">
+            <div className="scan-page-topline">
+              <button className="scan-page-back" onClick={closeScanDetail}>← All scans</button>
+              <span className={`scan-state ${selectedScan?.status === 'completed' ? 'scan-state-complete' : selectedScan?.status === 'stopped' ? 'scan-state-stopped' : 'scan-state-running'}`}>
+                <i /> {selectedScan?.status ?? (scanLoading ? 'Loading' : 'Unavailable')}
+              </span>
+            </div>
+            <div className="scan-page-hero-main">
+              <div className="scan-page-identity">
+                <span className="scan-page-avatar" aria-hidden="true">S{selectedScan?.id ?? view.id}</span>
+                <div>
+                  <p className="eyebrow">Scan detail</p>
+                  <h1>{selectedScan ? `Scan #${selectedScan.id}` : `Scan #${view.id}`}</h1>
+                  <a href={selectedScan?.url ?? '#'} target="_blank" rel="noreferrer">{selectedScan?.url ?? 'Loading scan details…'} <span aria-hidden="true">↗</span></a>
                 </div>
+              </div>
+              {selectedScan?.project_id ? (
+                <button className="secondary scan-project-action" onClick={() => openProject(selectedScan.project_id as number)}>
+                  View project <span aria-hidden="true">→</span>
+                </button>
               ) : null}
             </div>
-            <div className="page-actions">
-              <button className="secondary" onClick={closeScanDetail}>Back to dashboard</button>
-            </div>
           </header>
-          <section className="scan-hero-band">
-            <article className="band-card band-card-score">
-              <span>Overall score</span>
-              <strong>{selectedScan ? `${selectedScan.site_score}/100` : 'Loading'}</strong>
-              <small>{selectedScan?.phase2_summary ?? 'Scoring and summarizing the scan output'}</small>
+
+          <section className="scan-page-metrics" aria-label="Scan metrics">
+            <article>
+              <span>Quality score</span>
+              <strong>{selectedScan ? `${selectedScan.site_score}/100` : '—'}</strong>
+              <small>{selectedScan?.risk_level ?? 'Loading quality signal'}</small>
             </article>
-            <article className="band-card">
+            <article>
+              <span>Pages tested</span>
+              <strong>{selectedScan?.pages_tested ?? '—'}</strong>
+              <small>Pages included in this run</small>
+            </article>
+            <article>
+              <span>Total findings</span>
+              <strong>{selectedScan?.total_findings ?? '—'}</strong>
+              <small>{selectedScan ? `${selectedScan.unique_findings} unique after dedupe` : 'Loading findings'}</small>
+            </article>
+            <article>
               <span>Risk level</span>
-              <strong>{selectedScan?.risk_level ?? 'Loading'}</strong>
-              <small>{selectedScan?.comparison?.comparison_note ?? 'Comparison updates after the scan loads'}</small>
-            </article>
-            <article className="band-card">
-              <span>Findings</span>
-              <strong>{selectedScan ? selectedScan.total_findings : 0}</strong>
-              <small>{selectedScan ? `${selectedScan.unique_findings} unique issues after dedupe` : 'Waiting for scan data'}</small>
+              <strong>{selectedScan?.risk_level ?? '—'}</strong>
+              <small>{selectedScan?.comparison?.comparison_note ?? 'Current assessment'}</small>
             </article>
           </section>
-          <section className="detail-layout">
-            <aside className="detail-sidebar">
-              <article className="scan-card scan-card-accent">
-                <div className="scan-card-head">
-                  <h3>Snapshot</h3>
-                  <span>{selectedScan?.mode ?? 'Loading'}</span>
+
+          <section className="scan-page-workspace">
+            <aside className="scan-page-side">
+              <article className="scan-page-card scan-run-profile">
+                <div className="scan-page-card-heading">
+                  <div><p className="eyebrow">Run profile</p><h2>Execution details</h2></div>
+                  <span className="scan-page-card-icon" aria-hidden="true">⌁</span>
                 </div>
                 {selectedScan ? (
-                  <div className="scan-card-list">
-                    <div><span>Status</span><strong>{selectedScan.status}</strong></div>
-                    <div><span>Pages tested</span><strong>{selectedScan.pages_tested}</strong></div>
-                    <div><span>Total findings</span><strong>{selectedScan.total_findings}</strong></div>
-                    <div><span>Site score</span><strong>{selectedScan.site_score}/100</strong></div>
-                    <div><span>Risk level</span><strong>{selectedScan.risk_level}</strong></div>
-                    <div><span>Unique findings</span><strong>{selectedScan.unique_findings}</strong></div>
-                    <div><span>Phase 2 summary</span><strong>{selectedScan.phase2_summary ?? 'N/A'}</strong></div>
-                    <div><span>Executive summary</span><strong>{selectedScan.executive_summary ?? 'N/A'}</strong></div>
-                    <div><span>Broken links</span><strong>{selectedScan.broken_links}</strong></div>
-                    <div><span>Started</span><strong>{selectedScan.started_at}</strong></div>
-                    <div><span>Finished</span><strong>{selectedScan.finished_at ?? 'Running'}</strong></div>
-                    <div><span>Headless</span><strong>{selectedScan.headless ? 'Yes' : 'No'}</strong></div>
+                  <dl className="scan-run-facts">
+                    <div><dt>Status</dt><dd><span className="scan-inline-status"><i />{selectedScan.status}</span></dd></div>
+                    <div><dt>Mode</dt><dd>{selectedScan.mode}</dd></div>
+                    <div><dt>Browser visibility</dt><dd>{selectedScan.headless ? 'Headless' : 'Visible browser'}</dd></div>
+                    <div><dt>Started</dt><dd>{formatProjectDate(selectedScan.started_at)}</dd></div>
+                    <div><dt>Finished</dt><dd>{selectedScan.finished_at ? formatProjectDate(selectedScan.finished_at) : 'Still running'}</dd></div>
+                    <div><dt>Scan ID</dt><dd>#{selectedScan.id}</dd></div>
+                  </dl>
+                ) : <p className="scan-empty">Loading execution details…</p>}
+              </article>
+
+              <article className="scan-page-card scan-issue-card">
+                <div className="scan-page-card-heading">
+                  <div><p className="eyebrow">Issue profile</p><h2>Failure signals</h2></div>
+                </div>
+                {selectedScan ? (
+                  <div className="scan-issue-list">
+                    <div><span><i className="issue-red" />Navigation</span><strong>{selectedScan.navigation_failures}</strong></div>
+                    <div><span><i className="issue-orange" />Slow pages</span><strong>{selectedScan.slow_pages}</strong></div>
+                    <div><span><i className="issue-blue" />JavaScript</span><strong>{selectedScan.js_errors}</strong></div>
+                    <div><span><i className="issue-purple" />API failures</span><strong>{selectedScan.api_failures}</strong></div>
+                    <div><span><i className="issue-green" />Broken links</span><strong>{selectedScan.broken_links}</strong></div>
+                    <div><span><i className="issue-gray" />Resources</span><strong>{selectedScan.resource_failures}</strong></div>
                   </div>
-                ) : (
-                  <p className="scan-empty">{scanLoading ? 'Loading scan details...' : 'Scan details unavailable.'}</p>
-                )}
+                ) : null}
               </article>
             </aside>
 
-            <div className="detail-main">
-              <div className="scan-detail-hero">
-                <div>
-                  <p className="eyebrow">Scan intelligence</p>
-                  <p className="scan-detail-subtitle">
-                    A focused view of what happened during the scan, what was found, and what artifacts were produced.
-                  </p>
+            <div className="scan-page-main">
+              <article className="scan-page-card scan-quality-card">
+                <div className="scan-page-card-heading">
+                  <div><p className="eyebrow">Quality intelligence</p><h2>Assessment summary</h2></div>
+                  <span className="scan-quality-label">Latest result</span>
                 </div>
                 {selectedScan ? (
-                  <div className="hero-metrics">
-                    <div>
-                      <span>Overall</span>
-                      <strong>{selectedScan.site_score}/100</strong>
+                  <div className="scan-quality-content">
+                    <div className="scan-quality-ring" style={{ background: `conic-gradient(#38bdf8 ${selectedScan.site_score}%, rgba(255,255,255,.07) 0)` }}>
+                      <div><strong>{selectedScan.site_score}</strong><span>out of 100</span></div>
                     </div>
-                    <div>
-                      <span>Risk</span>
-                      <strong>{selectedScan.risk_level}</strong>
-                    </div>
-                    <div>
-                      <span>Findings</span>
-                      <strong>{selectedScan.total_findings}</strong>
+                    <div className="scan-quality-copy">
+                      <span className={`list-badge list-badge-score ${selectedScan.site_score >= 90 ? 'list-badge-good' : selectedScan.site_score >= 70 ? 'list-badge-warn' : 'list-badge-alert'}`}>{selectedScan.risk_level}</span>
+                      <h3>{selectedScan.executive_summary ?? selectedScan.phase2_summary ?? `${selectedScan.pages_tested} pages were assessed and ${selectedScan.total_findings} findings were recorded.`}</h3>
+                      <div className="scan-quality-stats">
+                        <div><span>Unique</span><strong>{selectedScan.unique_findings}</strong></div>
+                        <div><span>Missing UI</span><strong>{selectedScan.missing_elements}</strong></div>
+                        <div><span>Third party</span><strong>{selectedScan.third_party_failures}</strong></div>
+                        <div><span>Artifacts</span><strong>{selectedScan.artifacts.length}</strong></div>
+                      </div>
                     </div>
                   </div>
-                ) : null}
-              </div>
+                ) : <div className="scan-page-loading">Loading assessment intelligence…</div>}
+              </article>
 
-              <section className="scan-card">
-                <div className="scan-card-head">
-                  <h3>Findings</h3>
-                <span>{selectedScan?.findings.length ?? 0}</span>
-              </div>
+              <article className="scan-page-card scan-findings-card">
+                <div className="scan-page-card-heading">
+                  <div><p className="eyebrow">Evidence</p><h2>Findings by category</h2></div>
+                  <span className="scan-quality-label">{selectedScan?.findings.length ?? 0} findings</span>
+                </div>
                 {selectedScan && groupedScanFindings.length ? (
-                  <div className="finding-groups">
-                    {groupedScanFindings.map(([category, findings]) => (
-                      <details key={category} className="finding-group" open={findings.length <= 3}>
+                  <div className="scan-finding-groups">
+                    {groupedScanFindings.map(([category, findings], groupIndex) => (
+                      <details key={category} className="scan-finding-group" open={groupIndex === 0}>
                         <summary>
-                          <strong>{category}</strong>
-                          <span>{findings.length}</span>
+                          <span className="scan-finding-category"><i />{category.replace(/_/g, ' ')}</span>
+                          <span><strong>{findings.length}</strong><i aria-hidden="true">⌄</i></span>
                         </summary>
-                        <ul className="finding-preview-list">
-                          {findings.slice(0, 3).map((finding) => (
+                        <ul>
+                          {findings.slice(0, 5).map((finding) => (
                             <li key={finding.id}>
-                              <strong>{finding.message}</strong>
-                              <small>
-                                {finding.url ?? 'Global'}
-                                {finding.note ? ` · ${finding.note}` : ''}
-                              </small>
+                              <span className="scan-finding-number">{String(finding.id).padStart(2, '0')}</span>
+                              <div><strong>{finding.message}</strong><small>{finding.url ?? 'Global finding'}{finding.note ? ` · ${finding.note}` : ''}</small></div>
                             </li>
                           ))}
-                          {findings.length > 3 ? (
-                            <li className="finding-more">
-                              +{findings.length - 3} more in this category
-                            </li>
-                          ) : null}
+                          {findings.length > 5 ? <li className="scan-finding-more">+{findings.length - 5} additional findings in this category</li> : null}
                         </ul>
                       </details>
                     ))}
                   </div>
                 ) : (
-                  <p className="scan-empty">{scanLoading ? 'Loading findings...' : 'No findings captured. This scan looks clean.'}</p>
+                  <div className="scan-page-empty"><span aria-hidden="true">✓</span><div><h3>No findings captured</h3><p>This scan did not record any actionable issues.</p></div></div>
                 )}
-              </section>
+              </article>
 
-              <section className="scan-card">
-                <div className="scan-card-head">
-                  <h3>Score Breakdown</h3>
-                <span>{selectedScan?.site_score ?? 0}/100</span>
-              </div>
-                {selectedScan && selectedScan.score_breakdown.length ? (
-                  <div className="finding-groups">
+              <article className="scan-page-card scan-score-card">
+                <div className="scan-page-card-heading">
+                  <div><p className="eyebrow">Scoring</p><h2>Score breakdown</h2></div>
+                  <span className="scan-quality-label">{selectedScan?.site_score ?? 0}/100</span>
+                </div>
+                {selectedScan?.score_breakdown.length ? (
+                  <div className="scan-score-grid">
                     {selectedScan.score_breakdown.map((group) => (
-                      <details key={group.label} className="finding-group" open>
-                        <summary>
-                          <strong>{group.label}</strong>
-                          <span>{group.score}/100</span>
-                        </summary>
-                        <ul className="finding-preview-list">
-                          {group.deductions.length ? (
-                            group.deductions.map((deduction, index) => (
-                              <li key={`${group.label}-${index}`}>
-                                <strong>{deduction}</strong>
-                                <small>Score impact</small>
-                              </li>
-                            ))
-                          ) : (
-                            <li className="finding-more">No deductions for this category</li>
-                          )}
-                        </ul>
+                      <details key={group.label} className="scan-score-group">
+                        <summary><span>{group.label}</span><strong>{group.score}/100</strong></summary>
+                        <ul>{group.deductions.length ? group.deductions.map((deduction, index) => <li key={`${group.label}-${index}`}>{deduction}</li>) : <li>No deductions</li>}</ul>
                       </details>
                     ))}
                   </div>
-                ) : (
-                  <p className="scan-empty">{scanLoading ? 'Loading score breakdown...' : 'No score breakdown available.'}</p>
-                )}
-              </section>
+                ) : <div className="scan-page-empty compact-scan-empty"><span aria-hidden="true">◎</span><div><h3>No score breakdown</h3><p>This scan does not include category-level scoring data.</p></div></div>}
+              </article>
 
-              <section className="scan-card">
-                <div className="scan-card-head">
-                  <h3>Executive Summary</h3>
-                  <span>At a glance</span>
-                </div>
-                {selectedScan?.executive_summary ? (
-                  <pre className="report compact-report">{selectedScan.executive_summary}</pre>
-                ) : (
-                  <p className="scan-empty">{scanLoading ? 'Loading executive summary...' : 'No executive summary available.'}</p>
-                )}
-              </section>
-
-              <section className="scan-card">
-                <div className="scan-card-head">
-                  <h3>Comparison</h3>
-                  <span>{selectedScan?.comparison?.comparison_note ?? 'No previous scan'}</span>
-                </div>
-                {selectedScan?.comparison ? (
-                  <div className="scan-card-list">
-                    <div><span>Previous scan</span><strong>{selectedScan.comparison.previous_scan_id ?? 'N/A'}</strong></div>
-                    <div><span>Previous score</span><strong>{selectedScan.comparison.previous_score ?? 'N/A'}</strong></div>
-                    <div><span>Score delta</span><strong>{selectedScan.comparison.score_delta ?? 'N/A'}</strong></div>
-                    <div><span>Previous risk</span><strong>{selectedScan.comparison.previous_risk_level ?? 'N/A'}</strong></div>
-                  </div>
-                ) : (
-                  <p className="scan-empty">{scanLoading ? 'Loading comparison...' : 'No prior scan available for comparison.'}</p>
-                )}
-              </section>
-
-              <div className="detail-grid-two">
-                <article className="scan-card">
-                  <div className="scan-card-head">
-                    <h3>Artifacts</h3>
-                    <span>{selectedScan?.artifacts.length ?? 0}</span>
-                  </div>
+              <div className="scan-support-grid">
+                <article className="scan-page-card">
+                  <div className="scan-page-card-heading"><div><p className="eyebrow">Progress</p><h2>Previous comparison</h2></div></div>
+                  {selectedScan?.comparison ? (
+                    <div className="scan-comparison-grid">
+                      <div><span>Previous scan</span><strong>{selectedScan.comparison.previous_scan_id ? `#${selectedScan.comparison.previous_scan_id}` : '—'}</strong></div>
+                      <div><span>Previous score</span><strong>{selectedScan.comparison.previous_score ?? '—'}</strong></div>
+                      <div><span>Score change</span><strong>{selectedScan.comparison.score_delta ?? '—'}</strong></div>
+                      <div><span>Previous risk</span><strong>{selectedScan.comparison.previous_risk_level ?? '—'}</strong></div>
+                    </div>
+                  ) : <p className="scan-support-empty">No previous scan is available for comparison.</p>}
+                </article>
+                <article className="scan-page-card">
+                  <div className="scan-page-card-heading"><div><p className="eyebrow">Evidence files</p><h2>Artifacts</h2></div><span className="scan-quality-label">{selectedScan?.artifacts.length ?? 0}</span></div>
                   {selectedScan?.artifacts.length ? (
-                    <ul className="artifact-list">
-                      {selectedScan.artifacts.map((artifact) => (
-                        <li key={artifact.id}>
-                          <strong>{artifact.kind}</strong>
-                          <span>{artifact.path}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="scan-empty">{scanLoading ? 'Loading artifacts...' : 'No artifacts were saved for this scan.'}</p>
-                  )}
+                    <ul className="scan-artifact-list">{selectedScan.artifacts.map((artifact) => <li key={artifact.id}><span>{artifact.kind}</span><strong>{artifact.path}</strong></li>)}</ul>
+                  ) : <p className="scan-support-empty">No screenshots or recordings were saved for this scan.</p>}
                 </article>
               </div>
 
-              <section className="scan-raw scan-raw-spaced">
-                <div className="scan-card-head">
-                  <h3>Raw Report</h3>
-                  <span>Full output</span>
-                </div>
-                {selectedScan?.raw_report ? (
-                  <pre className="report compact-report">{selectedScan.raw_report}</pre>
-                ) : (
-                  <p className="scan-empty">{scanLoading ? 'Loading raw report...' : 'No raw report was stored for this scan.'}</p>
-                )}
-              </section>
+              <details className="scan-page-card scan-raw-card">
+                <summary><span><span className="eyebrow">Technical output</span><strong>Raw scan report</strong></span><span>View full output <i aria-hidden="true">⌄</i></span></summary>
+                {selectedScan?.raw_report ? <pre>{selectedScan.raw_report}</pre> : <p className="scan-support-empty">No raw report was stored for this scan.</p>}
+              </details>
             </div>
           </section>
-        </>
+        </section>
       ) : null}
 
       {view.kind === 'project' && selectedProject ? (
-        <>
-          <header className="page-hero">
-            <div>
-              <p className="eyebrow">Project detail</p>
-              <h1>{selectedProject.name}</h1>
-              <p className="page-subtitle">{selectedProject.base_url}</p>
+        <section className="project-page">
+          <header className="project-hero">
+            <div className="project-hero-topline">
+              <button className="project-back-link" onClick={closeProjectDetail}>← All projects</button>
+              <span className={`project-health ${projectLatestScan && projectLatestScan.site_score >= 90 ? 'project-health-good' : projectLatestScan && projectLatestScan.site_score >= 70 ? 'project-health-warn' : 'project-health-alert'}`}>
+                <i /> {projectLatestScan ? projectLatestScan.risk_level : 'Awaiting first scan'}
+              </span>
             </div>
-            <button className="secondary" onClick={closeProjectDetail}>Back to dashboard</button>
+            <div className="project-hero-main">
+              <div className="project-identity">
+                <span className="project-avatar" aria-hidden="true">{projectDisplayName.slice(0, 2).toUpperCase()}</span>
+                <div>
+                  <p className="eyebrow">Project detail</p>
+                  <h1>{projectDisplayName}</h1>
+                  <a href={selectedProject.base_url} target="_blank" rel="noreferrer">{selectedProject.base_url} <span aria-hidden="true">↗</span></a>
+                </div>
+              </div>
+              <button
+                className="project-scan-action"
+                onClick={() => {
+                  setUrl(selectedProject.base_url)
+                  closeProjectDetail()
+                }}
+              >
+                <span aria-hidden="true">＋</span> Run new scan
+              </button>
+            </div>
           </header>
-          <section className="detail-layout">
-            <aside className="detail-sidebar">
-              <article className="scan-card scan-card-accent">
-                <div className="scan-card-head">
-                  <h3>Snapshot</h3>
-                  <span>Project</span>
+
+          <section className="project-metrics" aria-label="Project metrics">
+            <article>
+              <span>Latest score</span>
+              <strong>{projectLatestScan ? `${projectLatestScan.site_score}/100` : '—'}</strong>
+              <small>{projectLatestScan ? projectLatestScan.risk_level : 'No scan data yet'}</small>
+            </article>
+            <article>
+              <span>Total scans</span>
+              <strong>{projectScans.length}</strong>
+              <small>{projectScans.length === 1 ? 'Assessment completed' : 'Assessments completed'}</small>
+            </article>
+            <article>
+              <span>Average score</span>
+              <strong>{projectScans.length ? `${projectAverageScore}/100` : '—'}</strong>
+              <small>Across all project scans</small>
+            </article>
+            <article>
+              <span>Total findings</span>
+              <strong>{projectTotalFindings}</strong>
+              <small>{projectLatestScan ? `${projectLatestScan.unique_findings} unique in latest scan` : 'Nothing recorded yet'}</small>
+            </article>
+          </section>
+
+          <section className="project-workspace">
+            <aside className="project-side-column">
+              <article className="project-card project-info-card">
+                <div className="project-card-heading">
+                  <div>
+                    <p className="eyebrow">Project profile</p>
+                    <h2>About this project</h2>
+                  </div>
+                  <span className="project-card-icon" aria-hidden="true">◇</span>
                 </div>
-                <p>This project groups scans for the same base URL.</p>
-                <div className="scan-card-list">
-                  <div><span>Name</span><strong>{selectedProject.name}</strong></div>
-                  <div><span>Base URL</span><strong>{selectedProject.base_url}</strong></div>
-                  <div><span>Scans</span><strong>{projectScans.length}</strong></div>
-                  <div><span>Created</span><strong>{selectedProject.created_at}</strong></div>
-                  <div><span>Updated</span><strong>{selectedProject.updated_at}</strong></div>
-                </div>
+                <p className="project-card-copy">Scans for this base URL are grouped here so you can track quality over time.</p>
+                <dl className="project-facts">
+                  <div><dt>Base URL</dt><dd>{selectedProject.base_url}</dd></div>
+                  <div><dt>Created</dt><dd>{formatProjectDate(selectedProject.created_at)}</dd></div>
+                  <div><dt>Last updated</dt><dd>{formatProjectDate(selectedProject.updated_at)}</dd></div>
+                  <div><dt>Project ID</dt><dd>#{selectedProject.id}</dd></div>
+                </dl>
+              </article>
+
+              <article className="project-card project-next-card">
+                <span className="project-next-icon" aria-hidden="true">↗</span>
+                <p className="eyebrow">Recommended action</p>
+                <h2>{projectLatestScan ? 'Keep your quality signal fresh' : 'Establish your quality baseline'}</h2>
+                <p>{projectLatestScan ? 'Run another scan after your next release to compare results and catch regressions.' : 'Run the first scan to generate a score, findings, and project health summary.'}</p>
+                <button
+                  className="secondary"
+                  onClick={() => {
+                    setUrl(selectedProject.base_url)
+                    closeProjectDetail()
+                  }}
+                >
+                  Configure scan <span aria-hidden="true">→</span>
+                </button>
               </article>
             </aside>
 
-            <div className="detail-main">
-              <div className="scan-detail-hero">
-                <div>
-                  <p className="scan-detail-subtitle">
-                    Dedicated project view with its base URL, update history, and the scans that belong to it.
-                  </p>
+            <div className="project-main-column">
+              <article className="project-card project-latest-card">
+                <div className="project-card-heading">
+                  <div>
+                    <p className="eyebrow">Latest assessment</p>
+                    <h2>Current quality signal</h2>
+                  </div>
+                  {projectLatestScan ? <span className="project-scan-id">Scan #{projectLatestScan.id}</span> : null}
                 </div>
-              </div>
-
-              <div className="detail-grid-two">
-                <article className="scan-card">
-                  <div className="scan-card-head">
-                    <h3>Recent scans</h3>
-                    <span>{projectScans.length}</span>
+                {projectLatestScan ? (
+                  <div className="project-latest-content">
+                    <div
+                      className="project-score-ring"
+                      style={{ background: `conic-gradient(#8b7cff ${projectLatestScan.site_score}%, rgba(255,255,255,.07) 0)` }}
+                    >
+                      <div><strong>{projectLatestScan.site_score}</strong><span>out of 100</span></div>
+                    </div>
+                    <div className="project-latest-summary">
+                      <span className={`list-badge list-badge-score ${projectLatestScan.site_score >= 90 ? 'list-badge-good' : projectLatestScan.site_score >= 70 ? 'list-badge-warn' : 'list-badge-alert'}`}>
+                        {projectLatestScan.risk_level}
+                      </span>
+                      <h3>{projectLatestScan.phase2_summary ?? `${projectLatestScan.pages_tested} pages assessed with ${projectLatestScan.unique_findings} unique findings.`}</h3>
+                      <div className="project-latest-stats">
+                        <div><span>Pages</span><strong>{projectLatestScan.pages_tested}</strong></div>
+                        <div><span>Findings</span><strong>{projectLatestScan.total_findings}</strong></div>
+                        <div><span>Unique</span><strong>{projectLatestScan.unique_findings}</strong></div>
+                        <div><span>Mode</span><strong>{projectLatestScan.mode}</strong></div>
+                      </div>
+                    </div>
+                    <button className="project-open-scan" onClick={() => openScan(projectLatestScan.id)} aria-label={`Open scan ${projectLatestScan.id}`}>→</button>
                   </div>
-                  {projectScans.length ? (
-                    <ul className="timeline">
-                      {projectScans.map((scan) => (
-                        <li key={scan.id} className="timeline-item">
-                          <div className="timeline-marker" />
-                          <div>
-                            <strong>{scan.status}</strong>
-                            <p>{scan.pages_tested} pages · {scan.total_findings} findings</p>
-                            <small>{scan.started_at}</small>
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="scan-empty">No scans are linked to this project yet.</p>
-                  )}
-                </article>
-
-                <article className="scan-card">
-                  <div className="scan-card-head">
-                    <h3>Linked scans</h3>
-                    <span>{projectScans.length}</span>
+                ) : (
+                  <div className="project-empty-state">
+                    <span aria-hidden="true">◎</span>
+                    <h3>No scans yet</h3>
+                    <p>Run your first assessment to populate this quality overview.</p>
                   </div>
-                  {projectScans.length ? (
-                    <ul className="artifact-list">
-                      {projectScans.map((scan) => (
-                        <li key={scan.id} onClick={() => openScan(scan.id)} className="clickable">
-                          <strong>{scan.url}</strong>
-                          <span>{scan.status} · {scan.pages_tested} pages · {scan.total_findings} findings</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="scan-empty">No linked scans available.</p>
-                  )}
-                </article>
-              </div>
+                )}
+              </article>
+
+              <article className="project-card project-history-card">
+                <div className="project-card-heading">
+                  <div>
+                    <p className="eyebrow">Scan history</p>
+                    <h2>Recent assessments</h2>
+                  </div>
+                  <span className="project-history-count">{projectScans.length} total</span>
+                </div>
+                {projectScans.length ? (
+                  <div className="project-scan-table">
+                    <div className="project-scan-table-head"><span>Assessment</span><span>Health</span><span>Coverage</span><span>Started</span><span /></div>
+                    {projectScans.map((scan) => (
+                      <button key={scan.id} className="project-scan-row" onClick={() => openScan(scan.id)}>
+                        <span><strong>Scan #{scan.id}</strong><small>{scan.status}</small></span>
+                        <span><strong>{scan.site_score}/100</strong><small>{scan.risk_level}</small></span>
+                        <span><strong>{scan.pages_tested} pages</strong><small>{scan.unique_findings} unique findings</small></span>
+                        <span><strong>{formatProjectDate(scan.started_at)}</strong><small>{scan.mode}</small></span>
+                        <i aria-hidden="true">→</i>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="project-empty-state compact-empty"><p>No scan history is available for this project.</p></div>
+                )}
+              </article>
             </div>
           </section>
-        </>
+        </section>
       ) : null}
     </div>
   )

@@ -1,6 +1,7 @@
 import io
 import os
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -115,7 +116,7 @@ class _FakePlaywrightContext:
 
 
 class _FakePlaywrightBrowser:
-    def new_context(self, ignore_https_errors=True, viewport=None, record_video_dir=None, record_video_size=None):
+    def new_context(self, ignore_https_errors=True, viewport=None, no_viewport=False, record_video_dir=None, record_video_size=None):
         return _FakePlaywrightContext()
 
     def close(self):
@@ -161,6 +162,28 @@ class Phase1ScaffoldTests(unittest.TestCase):
         self.assertGreaterEqual(report.pages_tested, 1)
         self.assertGreaterEqual(report.broken_links, 1)
         self.assertGreaterEqual(report.total_findings, 1)
+
+    def test_stopped_scan_retains_partial_report(self) -> None:
+        stop_event = threading.Event()
+
+        def logger(message: str) -> None:
+            if message.startswith("Discovered"):
+                stop_event.set()
+
+        tester = Phase1Tester(
+            "https://demo-webshop.com",
+            browser_mode="http",
+            logger=logger,
+            stop_event=stop_event,
+        )
+        with patch("qa_platform.scanner.urlopen", side_effect=_fake_urlopen):
+            with self.assertRaisesRegex(RuntimeError, "Scan stopped"):
+                tester.run()
+
+        partial = tester.partial_report()
+        self.assertIsNotNone(partial)
+        self.assertGreaterEqual(partial.pages_tested, 1)
+        self.assertEqual(partial.target_url, "https://demo-webshop.com")
 
     def test_browser_mode_uses_real_browser(self) -> None:
         with patch("qa_platform.scanner.sync_playwright", return_value=_FakePlaywright()):

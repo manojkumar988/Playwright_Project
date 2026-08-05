@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import re
 import threading
 import queue
@@ -232,8 +233,7 @@ def _parse_raw_report(raw_report: str | None) -> dict[str, object]:
     data["score_breakdown"] = breakdown
     return data
 
-
-def _persist_scan(db: Session, request: ScanRequest, report) -> Scan:
+def _create_scan(db: Session, request: ScanRequest) -> Scan:
     project = db.query(Project).filter(Project.base_url == str(request.url)).one_or_none()
     if project is None:
         project = Project(name=str(request.url), base_url=str(request.url))
@@ -249,6 +249,18 @@ def _persist_scan(db: Session, request: ScanRequest, report) -> Scan:
     )
     db.add(scan)
     db.flush()
+    return scan
+
+
+def _persist_scan(
+    db: Session,
+    request: ScanRequest,
+    report,
+    *,
+    scan: Scan | None = None,
+    status: str = "completed",
+) -> Scan:
+    scan = scan or _create_scan(db, request)
 
     for finding in report.findings:
         note = None
@@ -287,8 +299,8 @@ def _persist_scan(db: Session, request: ScanRequest, report) -> Scan:
     scan.slow_pages = report.slow_pages
     scan.total_findings = report.total_findings
     scan.raw_report = format_raw_report(report)
-    scan.status = "completed"
-    scan.finished_at = scan.finished_at or scan.started_at
+    scan.status = status
+    scan.finished_at = datetime.utcnow()
     return scan
 
 
@@ -426,10 +438,15 @@ def scan_live(request: ScanLiveRequest) -> StreamingResponse:
 
     def worker() -> None:
         db = SessionLocal()
-        report = None
+        tester = None
+        scan_id = None
         try:
+            scan_record = _create_scan(db, request)
+            db.commit()
+            scan_id = scan_record.id
+
             browser_mode = "browser" if request.mode == "browser-fast" else request.mode
-            report = Phase1Tester(
+            tester = Phase1Tester(
                 str(request.url),
                 browser_mode=browser_mode,
                 headless=request.headless,
@@ -437,14 +454,42 @@ def scan_live(request: ScanLiveRequest) -> StreamingResponse:
                 logger=logger,
                 stop_event=stop_event,
                 runtime_hook=_update_live_scan_runtime,
-            ).run()
-            _persist_scan(db, request, report)
+            )
+            report = tester.run()
+            scan_record = db.get(Scan, scan_id)
+            _persist_scan(db, request, report, scan=scan_record, status="completed")
             db.commit()
-            events.put({"type": "done", "report": format_raw_report(report)})
+            events.put({"type": "done", "report": format_raw_report(report), "scan_id": scan_id})
         except Exception as exc:
             db.rollback()
-            if str(exc) == "Scan stopped":
-                events.put({"type": "stopped", "message": "Scan stopped"})
+            stopped = str(exc) == "Scan stopped"
+            partial_report = tester.partial_report() if tester is not None else None
+            try:
+                scan_record = db.get(Scan, scan_id) if scan_id is not None else None
+                if scan_record is not None and partial_report is not None:
+                    _persist_scan(
+                        db,
+                        request,
+                        partial_report,
+                        scan=scan_record,
+                        status="stopped" if stopped else "failed",
+                    )
+                elif scan_record is not None:
+                    scan_record.status = "stopped" if stopped else "failed"
+                    scan_record.finished_at = datetime.utcnow()
+                db.commit()
+            except Exception:
+                db.rollback()
+
+            if stopped:
+                events.put(
+                    {
+                        "type": "stopped",
+                        "message": "Scan stopped — partial results saved",
+                        "report": format_raw_report(partial_report) if partial_report is not None else "",
+                        "scan_id": scan_id,
+                    }
+                )
             else:
                 events.put({"type": "error", "message": str(exc)})
         finally:
@@ -502,7 +547,7 @@ def root() -> dict[str, str]:
 def list_projects() -> list[ProjectResponse]:
     db = SessionLocal()
     try:
-        projects = db.query(Project).order_by(Project.created_at.desc()).all()
+        projects = db.query(Project).order_by(Project.created_at.asc()).all()
         return [_project_response(project) for project in projects]
     finally:
         db.close()
@@ -512,7 +557,7 @@ def list_projects() -> list[ProjectResponse]:
 def list_scans() -> list[ScanSummaryResponse]:
     db = SessionLocal()
     try:
-        scans = db.query(Scan).order_by(Scan.started_at.desc()).all()
+        scans = db.query(Scan).order_by(Scan.started_at.asc()).all()
         return [_scan_summary(scan) for scan in scans]
     finally:
         db.close()
@@ -548,7 +593,7 @@ def list_project_scans(project_id: int) -> list[ScanSummaryResponse]:
         project = db.query(Project).filter(Project.id == project_id).one_or_none()
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
-        scans = db.query(Scan).filter(Scan.project_id == project_id).order_by(Scan.started_at.desc()).all()
+        scans = db.query(Scan).filter(Scan.project_id == project_id).order_by(Scan.started_at.asc()).all()
         return [_scan_summary(scan) for scan in scans]
     finally:
         db.close()

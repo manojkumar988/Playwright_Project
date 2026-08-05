@@ -36,14 +36,21 @@ POPUP_DISMISS_SELECTORS = [
     'button:has-text("Close")',
     'button:has-text("Dismiss")',
     'button:has-text("No thanks")',
+    'button:has-text("Not now")',
+    'button:has-text("Maybe later")',
     'button:has-text("Skip")',
     'button:has-text("Reject")',
     'button[aria-label*="close" i]',
     'button[aria-label*="dismiss" i]',
+    'button[title*="close" i]',
+    'button[title*="dismiss" i]',
     '[role="button"][aria-label*="close" i]',
     '[role="button"][aria-label*="dismiss" i]',
     '[data-testid*="close" i]',
     '[data-testid*="dismiss" i]',
+    '[id*="onetrust-close" i]',
+    '[id*="onetrust-reject" i]',
+    '[id*="onetrust-accept" i]',
 ]
 IGNORED_NETWORK_HOSTS = {
     "www.google-analytics.com",
@@ -131,6 +138,7 @@ class Phase1Tester:
     logger: callable = field(default=lambda message: print(message, flush=True), repr=False, compare=False)
     stop_event: threading.Event | None = field(default=None, repr=False, compare=False)
     runtime_hook: callable | None = field(default=None, repr=False, compare=False)
+    latest_report: TestReport | None = field(default=None, init=False, repr=False, compare=False)
 
     def _should_stop(self) -> bool:
         return bool(self.stop_event and self.stop_event.is_set())
@@ -150,32 +158,44 @@ class Phase1Tester:
         except Exception:
             pass
 
+        scopes: list[tuple[str, object]] = [("page", page)]
+        try:
+            frames = getattr(page, "frames", [])
+            for index, frame in enumerate(frames[1:], start=1):
+                scopes.append((f"frame-{index}", frame))
+        except Exception:
+            pass
+
         for _ in range(POPUP_DISMISS_TRIES):
             if self._page_is_closed(page):
                 return dismissed
             dismissed_this_round = False
-            for selector in POPUP_DISMISS_SELECTORS:
-                try:
-                    locator = page.locator(selector).first
-                    if locator.count() == 0 or not locator.is_visible():
-                        continue
-                    locator.click(timeout=1200, force=True)
-                    dismissed = True
-                    dismissed_this_round = True
-                    self._log(f"[browser] Dismissed interruption: {selector}")
+            for scope_name, scope in scopes:
+                for selector in POPUP_DISMISS_SELECTORS:
                     try:
-                        page.wait_for_timeout(200)
+                        locator = scope.locator(selector).first
+                        if locator.count() == 0 or not locator.is_visible():
+                            continue
+                        locator.click(timeout=1200, force=True)
+                        dismissed = True
+                        dismissed_this_round = True
+                        self._log(f"[browser] Dismissed interruption ({scope_name}): {selector}")
+                        try:
+                            page.wait_for_timeout(200)
+                        except Exception:
+                            pass
+                        break
                     except Exception:
-                        pass
+                        continue
+                if dismissed_this_round:
                     break
-                except Exception:
-                    continue
             if not dismissed_this_round:
                 break
         return dismissed
 
     def run(self) -> TestReport:
         report = TestReport(target_url=self.target_url)
+        self.latest_report = report
 
         self._raise_if_stopped()
         base_url = self._normalize_url(self.target_url)
@@ -345,6 +365,8 @@ class Phase1Tester:
                     if response and response.status >= 400:
                         self._capture_error_screenshot(page, normalized, f"http-{response.status}")
                 except Exception as exc:
+                    if str(exc) == "Scan stopped":
+                        raise
                     self._log(f"[browser] Error on {normalized}: {exc}")
                     if self._page_is_closed(page):
                         recovered = self._recover_scan_page(browser, context, console_errors, network_errors)
@@ -381,9 +403,14 @@ class Phase1Tester:
                 pass
 
     def _open_browser_context(self, browser: Browser) -> BrowserContext:
+        if self.headless:
+            return browser.new_context(
+                ignore_https_errors=True,
+                viewport={"width": 1280, "height": 720},
+            )
         return browser.new_context(
             ignore_https_errors=True,
-            viewport=None,
+            no_viewport=True,
         )
 
     def _recover_scan_page(
@@ -581,6 +608,16 @@ class Phase1Tester:
                     return
                 count += 1
             except Exception as exc:
+                if str(exc) == "Scan stopped":
+                    raise
+                restored = False
+                try:
+                    if not self._page_is_closed(page) and self._strip_fragment(page.url) != self._strip_fragment(current_url):
+                        restored = self._restore_page_url(page, current_url)
+                except Exception:
+                    restored = False
+                if restored:
+                    self._log(f"[browser] Recovered original page after click error: {current_url}")
                 if "Target page, context or browser has been closed" in str(exc):
                     self._log(f"[browser] Click aborted because page closed: {text}")
                     return
@@ -593,23 +630,43 @@ class Phase1Tester:
                         evidence=[self.evidence_for_url(current_url, note=str(exc))],
                     )
                 )
-
-    def _restore_page_url(self, page: Page, current_url: str) -> None:
-        if self._strip_fragment(page.url) == self._strip_fragment(current_url):
-            return
+    def _restore_page_url(self, page: Page, current_url: str) -> bool:
+        expected_url = self._strip_fragment(current_url)
         try:
-            try:
-                page.goto(current_url, wait_until="domcontentloaded", timeout=self.timeout_seconds * 1000)
-            except TypeError:
-                page.goto(current_url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_timeout(POST_NAVIGATION_PAUSE_MS)
-            except Exception:
-                pass
-            self._dismiss_interruptions(page)
-            return
+            if self._strip_fragment(page.url) == expected_url:
+                return True
         except Exception:
-            pass
+            return False
+
+        restore_attempts = [
+            ("back", getattr(page, "go_back", None)),
+            ("goto", getattr(page, "goto", None)),
+        ]
+        for method, operation in restore_attempts:
+            if not callable(operation):
+                continue
+            try:
+                if method == "back":
+                    try:
+                        operation(wait_until="domcontentloaded", timeout=min(self.timeout_seconds * 1000, 5000))
+                    except TypeError:
+                        operation(wait_until="domcontentloaded")
+                else:
+                    try:
+                        operation(current_url, wait_until="domcontentloaded", timeout=self.timeout_seconds * 1000)
+                    except TypeError:
+                        operation(current_url, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_timeout(POST_NAVIGATION_PAUSE_MS)
+                except Exception:
+                    pass
+                if self._strip_fragment(page.url) == expected_url:
+                    self._dismiss_interruptions(page)
+                    return True
+            except Exception as exc:
+                self._log(f"[browser] Could not restore page with {method}: {exc}")
+        self._log(f"[browser] Page restore failed; visible page is {getattr(page, 'url', 'unknown')}")
+        return False
 
     def _browser_action_links(self, page: Page, base_url: str, current_url: str, clicked_seen: Set[str]) -> list[dict]:
         try:
@@ -955,6 +1012,14 @@ class Phase1Tester:
 
     def _aggregate_counts(self, report: TestReport) -> None:
         unique_findings = self._dedupe_findings(report.findings)
+        report.broken_links = 0
+        report.js_errors = 0
+        report.api_failures = 0
+        report.resource_failures = 0
+        report.third_party_failures = 0
+        report.navigation_failures = 0
+        report.missing_elements = 0
+        report.slow_pages = 0
         report.unique_findings = unique_findings
         for finding in report.findings:
             if finding.category == "broken_link":
@@ -978,6 +1043,12 @@ class Phase1Tester:
         report.score_weights = self._score_weights()
         report.phase2_summary = self._build_phase2_summary(report, unique_findings)
         report.executive_summary = self._build_executive_summary(report, unique_findings)
+
+    def partial_report(self) -> TestReport | None:
+        """Return the report collected so far, finalized for persistence and display."""
+        if self.latest_report is not None:
+            self._aggregate_counts(self.latest_report)
+        return self.latest_report
 
     @staticmethod
     def _dedupe_findings(findings: list[Finding]) -> list[Finding]:

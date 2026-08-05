@@ -1,21 +1,22 @@
 # Autonomous QA Platform
 
-Autonomous QA Platform is a Phase 1 website testing stack with:
+Autonomous QA Platform is a website testing stack with:
 
 - a Python CLI scanner in `src/qa_platform`
 - a FastAPI backend in `backend/`
 - a React/Vite frontend in `frontend/`
 
-The scanner can use Playwright when it is installed. If Playwright is not available, it falls back to HTTP crawling.
+The scanner uses Playwright for browser scans when installed and can fall back to HTTP crawling.
 
 ## Project Layout
 
 - `src/qa_platform/` - core scanning and report formatting logic
 - `backend/` - FastAPI app, database models, and API endpoints
 - `frontend/` - React dashboard for scan and project data
-- `tests/` - scaffold tests
-- `.env.example` - sample environment variables
-- `qa_schema.sql` - database schema
+- `tests/` - scanner regression tests
+- `.env.example` - backend environment template
+- `frontend/.env.example` - frontend environment template
+- `qa_schema.sql` - database schema reference
 
 ## Setup
 
@@ -33,7 +34,14 @@ cd frontend
 npm install
 ```
 
-4. Copy `.env.example` to `.env` and adjust any local settings you need.
+4. Configure the environment files:
+
+```bash
+cp .env.example .env
+cp frontend/.env.example frontend/.env
+```
+
+Set `DATABASE_URL` for the backend and `VITE_API_BASE` if the frontend should use a backend other than `http://127.0.0.1:8000`.
 
 ## Python CLI
 
@@ -62,13 +70,15 @@ Start the backend API:
 uvicorn backend.app:app --reload
 ```
 
-The API initializes the database on startup and accepts requests from the local frontend on `http://localhost:5173`.
+The API initializes the database on startup and accepts requests from the local frontend.
 
 Main endpoints:
 
 - `GET /health`
 - `GET /`
 - `POST /scan`
+- `POST /scan/live` - streams scan events and the final report
+- `POST /scan/live/stop` - stops the active scan and preserves partial results
 
 Example request:
 
@@ -86,7 +96,6 @@ Run the frontend locally:
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
@@ -95,10 +104,6 @@ Build for production:
 ```bash
 npm run build
 ```
-
-## Environment
-
-Use `.env.example` as the template for local configuration.
 
 ## Contributing
 
