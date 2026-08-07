@@ -56,6 +56,7 @@ type LiveEvent =
   | { type: 'error'; message: string }
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8000'
+const TOKEN_KEY = 'qa_access_token'
 
 const classifyLiveLog = (message: string) => {
   const normalized = message.toLowerCase()
@@ -69,6 +70,7 @@ const classifyLiveLog = (message: string) => {
 
 type CompletedScoreGroup = { label: string; score: number; deductions: string[] }
 type CompletedFinding = { severity: string; message: string }
+type Toast = { id: number; kind: 'success' | 'error' | 'info'; message: string }
 
 const parseCompletedReport = (raw: string) => {
   const lines = raw.split(/\r?\n/)
@@ -136,12 +138,29 @@ const formatProjectDate = (value: string) => {
 }
 
 export default function App() {
+  const [token, setToken] = useState(() => window.localStorage.getItem(TOKEN_KEY) ?? '')
+  const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authConfirmPassword, setAuthConfirmPassword] = useState('')
+  const [authResetToken, setAuthResetToken] = useState('')
+  const [authBusy, setAuthBusy] = useState(false)
+  const [googleBusy, setGoogleBusy] = useState(false)
+  const [authError, setAuthError] = useState('')
+  const [authNotice, setAuthNotice] = useState('')
+  const [toast, setToast] = useState<Toast | null>(null)
   const [url, setUrl] = useState('')
   const [mode, setMode] = useState('browser')
   const [headless, setHeadless] = useState(false)
   const [report, setReport] = useState('')
   const [projects, setProjects] = useState<Project[]>([])
   const [scans, setScans] = useState<Scan[]>([])
+  const [projectQuery, setProjectQuery] = useState('')
+  const [scanQuery, setScanQuery] = useState('')
+  const [scanStatusFilter, setScanStatusFilter] = useState('all')
+  const [projectPage, setProjectPage] = useState(1)
+  const [scanPage, setScanPage] = useState(1)
+  const [projectHistoryPage, setProjectHistoryPage] = useState(1)
   const [selectedScan, setSelectedScan] = useState<ScanDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -154,18 +173,186 @@ export default function App() {
   const [scanLoading, setScanLoading] = useState(false)
   const [view, setView] = useState<{ kind: 'home' } | { kind: 'scan'; id: number } | { kind: 'project'; id: number }>({ kind: 'home' })
 
+  const showToast = (message: string, kind: Toast['kind'] = 'info') => {
+    const id = Date.now()
+    setToast({ id, kind, message })
+    window.setTimeout(() => {
+      setToast((current) => current?.id === id ? null : current)
+    }, 3200)
+  }
+
+  const setAuthRoute = (mode: 'login' | 'register' | 'forgot' | 'reset', replace = false) => {
+    const paths = { login: '/login', register: '/register', forgot: '/forgot-password', reset: '/reset-password' }
+    setAuthMode(mode)
+    window.history[replace ? 'replaceState' : 'pushState']({}, '', paths[mode])
+  }
+
+  useEffect(() => {
+    const pathMode = { '/login': 'login', '/register': 'register', '/forgot-password': 'forgot', '/reset-password': 'reset' }[window.location.pathname] as 'login' | 'register' | 'forgot' | 'reset' | undefined
+    if (pathMode) setAuthMode(pathMode)
+    else if (!token && !window.location.hash) window.history.replaceState({}, '', '/login')
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ''))
+    const googleToken = params.get('oauth_token')
+    if (googleToken) {
+      setToken(googleToken)
+      window.localStorage.setItem(TOKEN_KEY, googleToken)
+      showToast('Signed in successfully', 'success')
+      window.history.replaceState({}, '', '/')
+      return
+    }
+    if (params.get('verified') === '1') {
+      setAuthNotice('Email verified successfully. You can now sign in.')
+      window.history.replaceState({}, '', '/login')
+    }
+    const resetToken = params.get('reset_token')
+    const resetEmail = params.get('reset_email')
+    if (resetToken && resetEmail) {
+      setAuthRoute('reset', true)
+      setAuthResetToken(resetToken)
+      setAuthEmail(resetEmail)
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!token) return
+    const authPaths = ['/login', '/register', '/forgot-password', '/reset-password']
+    if (!authPaths.includes(window.location.pathname)) return
+    const authenticatedHash = /^#(?:scan|project)\/\d+$/.test(window.location.hash) ? window.location.hash : ''
+    window.history.replaceState({}, '', `/${authenticatedHash}`)
+  }, [token])
+
+  useEffect(() => {
+    const handlePopState = () => {
+      const modes = { '/login': 'login', '/register': 'register', '/forgot-password': 'forgot', '/reset-password': 'reset' } as const
+      const mode = modes[window.location.pathname as keyof typeof modes]
+      if (mode) setAuthMode(mode)
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
+  const signInWithGoogle = async () => {
+    setGoogleBusy(true)
+    setAuthError('')
+    try {
+      const response = await fetch(`${API_BASE}/auth/google`)
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail ?? 'Google sign-in is unavailable')
+      window.location.href = payload.authorization_url
+    } catch (err) {
+      setGoogleBusy(false)
+      setAuthError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const apiFetch = (path: string, init: RequestInit = {}) => {
+    const headers = new Headers(init.headers)
+    if (token) headers.set('Authorization', `Bearer ${token}`)
+    return fetch(`${API_BASE}${path}`, { ...init, headers })
+  }
+
   const loadData = async () => {
+    if (!token) return
     const [projectsRes, scansRes] = await Promise.all([
-      fetch(`${API_BASE}/projects`),
-      fetch(`${API_BASE}/scans`),
+      apiFetch('/projects'),
+      apiFetch('/scans'),
     ])
+    if (projectsRes.status === 401 || scansRes.status === 401) {
+      setToken('')
+      window.localStorage.removeItem(TOKEN_KEY)
+      setAuthMode('login')
+      window.history.replaceState({}, '', '/login')
+      showToast('Your session expired. Please sign in again.', 'error')
+      throw new Error('Your session has expired. Please log in again.')
+    }
+    if (!projectsRes.ok || !scansRes.ok) throw new Error('Unable to load dashboard data')
     setProjects(await projectsRes.json())
     setScans(await scansRes.json())
   }
 
+  const submitAuth = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setAuthBusy(true)
+    setAuthError('')
+    if ((authMode === 'register' || authMode === 'reset') && authPassword !== authConfirmPassword) {
+      const message = 'Passwords do not match'
+      setAuthError(message)
+      showToast(message, 'error')
+      setAuthBusy(false)
+      return
+    }
+    try {
+      const endpoint = authMode === 'forgot' ? 'forgot-password' : authMode === 'reset' ? 'reset-password' : authMode
+      const body = authMode === 'forgot' ? { email: authEmail } : authMode === 'reset' ? { email: authEmail, token: authResetToken, password: authPassword } : { email: authEmail, password: authPassword }
+      const response = await fetch(API_BASE + '/auth/' + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail ?? 'Authentication failed')
+      if (authMode === 'register') {
+        const message = payload.message ?? 'Verification email sent. Check your inbox.'
+        setAuthNotice(message)
+        showToast(message, 'success')
+        setAuthRoute('login')
+        setAuthPassword('')
+        setAuthConfirmPassword('')
+        return
+      }
+      if (authMode === 'forgot') {
+        setAuthNotice(payload.message ?? 'If an account exists for that email, a password reset link has been sent.')
+        return
+      }
+      if (authMode === 'reset') {
+        setAuthNotice(payload.message ?? 'Your password has been reset. You can now sign in.')
+        setAuthRoute('login')
+        setAuthPassword('')
+        setAuthConfirmPassword('')
+        setAuthResetToken('')
+        return
+      }
+      setToken(payload.access_token)
+      window.localStorage.setItem(TOKEN_KEY, payload.access_token)
+      showToast('Signed in successfully', 'success')
+      setAuthPassword('')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      setAuthError(message)
+      showToast(message, 'error')
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const resendVerification = async () => {
+    setAuthBusy(true)
+    setAuthError('')
+    try {
+      const response = await fetch(`${API_BASE}/auth/resend-verification`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: authEmail }) })
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail ?? 'Unable to resend verification email')
+      setAuthNotice(payload.message)
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const logout = () => {
+    setToken('')
+    setAuthMode('login')
+    window.localStorage.removeItem(TOKEN_KEY)
+    setProjects([])
+    setScans([])
+    setSelectedScan(null)
+    setView({ kind: 'home' })
+    window.history.replaceState({}, '', '/login')
+    showToast('Signed out successfully', 'success')
+  }
+
   useEffect(() => {
+    if (!token) return
     void loadData().catch((err) => setError(String(err)))
-  }, [])
+  }, [token])
 
   useEffect(() => {
     const syncViewFromHash = () => {
@@ -183,6 +370,10 @@ export default function App() {
     window.addEventListener('hashchange', syncViewFromHash)
     return () => window.removeEventListener('hashchange', syncViewFromHash)
   }, [])
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+  }, [view])
 
   useEffect(() => {
     if (!loading) return undefined
@@ -207,7 +398,7 @@ export default function App() {
     setLiveOutcome('running')
     setLiveStartedAt(Date.now())
     try {
-      const response = await fetch(`${API_BASE}/scan/live`, {
+      const response = await apiFetch('/scan/live', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, mode, headless }),
@@ -260,7 +451,7 @@ export default function App() {
 
   const stopScan = async () => {
     try {
-      const response = await fetch(`${API_BASE}/scan/live/stop`, {
+      const response = await apiFetch('/scan/live/stop', {
         method: 'POST',
       })
       if (!response.ok) {
@@ -289,9 +480,43 @@ export default function App() {
     delay: `${index * 90}ms`,
   }))
 
+  useEffect(() => setProjectPage(1), [projectQuery])
+  useEffect(() => setScanPage(1), [scanQuery, scanStatusFilter])
+  useEffect(() => setProjectHistoryPage(1), [view.kind === 'project' ? view.id : null])
+
   const completedResult = report ? parseCompletedReport(report) : null
   const completedTarget = completedResult?.targetUrl.replace(/\/$/, '') ?? ''
   const completedScan = report ? [...scans].reverse().find((scan) => scan.url.replace(/\/$/, '') === completedTarget) ?? scans[scans.length - 1] ?? null : null
+  const PAGE_SIZE = 5
+  const filteredProjects = projects.filter((project) => {
+    const query = projectQuery.trim().toLowerCase()
+    return !query || `${project.name} ${project.base_url}`.toLowerCase().includes(query)
+  })
+  const filteredScans = scans.filter((scan) => {
+    const query = scanQuery.trim().toLowerCase()
+    const matchesQuery = !query || `${scan.url} ${scan.mode} ${scan.status} ${scan.risk_level}`.toLowerCase().includes(query)
+    return matchesQuery && (scanStatusFilter === 'all' || scan.status === scanStatusFilter)
+  })
+  const projectPageCount = Math.max(1, Math.ceil(filteredProjects.length / PAGE_SIZE))
+  const scanPageCount = Math.max(1, Math.ceil(filteredScans.length / PAGE_SIZE))
+  const visibleProjects = filteredProjects.slice((projectPage - 1) * PAGE_SIZE, projectPage * PAGE_SIZE)
+  const visibleScans = filteredScans.slice((scanPage - 1) * PAGE_SIZE, scanPage * PAGE_SIZE)
+
+  const downloadReport = (rawReport: string | null | undefined, filename: string) => {
+    if (!rawReport) {
+      setError('This scan has no report to export')
+      return
+    }
+    const blob = new Blob([rawReport], { type: 'text/plain;charset=utf-8' })
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(link.href)
+  }
+
   const openScan = (id: number) => {
     window.location.hash = `scan/${id}`
   }
@@ -312,7 +537,7 @@ export default function App() {
   const openScanDetail = async (id: number) => {
     setScanLoading(true)
     try {
-      const response = await fetch(`${API_BASE}/scans/${id}`)
+      const response = await apiFetch(`/scans/${id}`)
       if (!response.ok) {
         throw new Error(await response.text())
       }
@@ -328,6 +553,10 @@ export default function App() {
   const totalFindings = scans.reduce((total, scan) => total + scan.total_findings, 0)
   const selectedProject = view.kind === 'project' ? projects.find((project) => project.id === view.id) ?? null : null
   const projectScans = selectedProject ? scans.filter((scan) => scan.project_id === selectedProject.id) : []
+  const projectHistoryPageCount = Math.max(1, Math.ceil(projectScans.length / PAGE_SIZE))
+  const visibleProjectScans = [...projectScans]
+    .reverse()
+    .slice((projectHistoryPage - 1) * PAGE_SIZE, projectHistoryPage * PAGE_SIZE)
   const projectLatestScan = projectScans[projectScans.length - 1] ?? null
   const projectAverageScore = projectScans.length ? Math.round(projectScans.reduce((total, scan) => total + scan.site_score, 0) / projectScans.length) : 0
   const projectTotalFindings = projectScans.reduce((total, scan) => total + scan.total_findings, 0)
@@ -347,6 +576,18 @@ export default function App() {
         }, {}),
       ).sort((a, b) => b[1].length - a[1].length)
     : []
+  const selectedScanReportPages = selectedScan?.raw_report ? parseCompletedReport(selectedScan.raw_report).testedPages : []
+  const selectedScanTestedPages = selectedScan
+    ? Array.from(
+        new Set(
+          [
+            ...selectedScanReportPages,
+            ...selectedScan.findings.map((finding) => finding.url).filter((pageUrl): pageUrl is string => Boolean(pageUrl)),
+            selectedScan.url,
+          ].map((pageUrl) => pageUrl.trim()).filter(Boolean),
+        ),
+      )
+    : []
 
   useEffect(() => {
     if (view.kind !== 'scan') return
@@ -358,8 +599,47 @@ export default function App() {
 
   const shellClassName = view.kind === 'home' ? 'shell shell-home' : 'shell shell-detail'
 
+  if (!token) {
+    const authTitle = authMode === 'login' ? 'Welcome back' : authMode === 'register' ? 'Create your account' : authMode === 'forgot' ? 'Reset your password' : 'Choose a new password'
+    const authCopy = authMode === 'login' ? 'Sign in to access your projects, scans, and live testing console.' : authMode === 'register' ? 'Create an account to start running protected website scans.' : authMode === 'forgot' ? 'Enter your email and we will send you a secure password reset link.' : 'Your reset link is ready. Choose a new password for your account.'
+    return (
+      <main className="auth-shell">
+        {toast ? <div className="toast-container app-toast-container top-0 start-50 translate-middle-x p-3"><div className={`toast show app-toast app-toast-${toast.kind}`} role="status" aria-live="polite" aria-atomic="true"><div className="toast-header"><span className="app-toast-dot" aria-hidden="true" /><strong className="me-auto">{toast.kind === 'error' ? 'Action needed' : toast.kind === 'success' ? 'Success' : 'Notice'}</strong><button type="button" className="btn-close btn-close-white" aria-label="Close" onClick={() => setToast(null)} /></div><div className="toast-body">{toast.message}</div><span className="app-toast-timer" aria-hidden="true" /></div></div> : null}
+        <section className="auth-card">
+          <div className="brand-lockup"><span className="brand-mark" aria-hidden="true"><i /></span><div><p className="eyebrow">Autonomous QA</p><h1>Control Room</h1></div></div>
+          <p className="auth-kicker">Secure quality intelligence</p>
+          <h2>{authTitle}</h2>
+          <p className="auth-copy">{authCopy}</p>
+          <form className="auth-form" onSubmit={submitAuth}>
+            <label>Email<input type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} required disabled={authMode === 'reset'} /></label>
+            {authMode !== 'forgot' ? <label>Password<input type="password" autoComplete={authMode === 'login' ? 'current-password' : 'new-password'} minLength={8} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} required /></label> : null}
+            {authMode === 'register' || authMode === 'reset' ? <label>Confirm password<input type="password" autoComplete="new-password" minLength={8} value={authConfirmPassword} onChange={(event) => setAuthConfirmPassword(event.target.value)} required /></label> : null}
+            {authNotice ? <p className="auth-notice">{authNotice}</p> : null}
+            {authError ? <p className="auth-error">{authError}</p> : null}
+            {authMode === 'login' && authEmail && authError.toLowerCase().includes('verify') ? <button type="button" className="auth-resend" onClick={() => void resendVerification()} disabled={authBusy}>Resend verification email</button> : null}
+            {authMode === 'login' ? <button type="button" className="auth-resend" onClick={() => { setAuthRoute('forgot'); setAuthError(''); setAuthNotice('') }}>Forgot password?</button> : null}
+            <button className="primary auth-submit" type="submit" disabled={authBusy}>{authBusy ? 'Please wait…' : authMode === 'login' ? 'Sign in' : authMode === 'register' ? 'Create account' : authMode === 'forgot' ? 'Send reset link' : 'Reset password'}</button>
+          </form>
+          {(authMode === 'login' || authMode === 'register') ? <><div className="auth-divider"><span>or</span></div><button className="google-button" type="button" onClick={() => void signInWithGoogle()} disabled={googleBusy}><span className="google-g" aria-hidden="true">G</span>{googleBusy ? 'Opening Google…' : 'Continue with Google'}</button></> : null}
+          <button className="auth-switch" type="button" onClick={() => { setAuthRoute(authMode === 'login' ? 'register' : 'login'); setAuthError(''); setAuthNotice(''); setAuthPassword(''); setAuthConfirmPassword('') }}>{authMode === 'login' ? 'Need an account? Register' : 'Already have an account? Sign in'}</button>
+        </section>
+      </main>
+    )
+  }
   return (
     <div className={shellClassName}>
+      {toast ? <div className="toast-container app-toast-container top-0 start-50 translate-middle-x p-3"><div className={`toast show app-toast app-toast-${toast.kind}`} role="status" aria-live="polite" aria-atomic="true"><div className="toast-header"><span className="app-toast-dot" aria-hidden="true" /><strong className="me-auto">{toast.kind === 'error' ? 'Action needed' : toast.kind === 'success' ? 'Success' : 'Notice'}</strong><button type="button" className="btn-close btn-close-white" aria-label="Close" onClick={() => setToast(null)} /></div><div className="toast-body">{toast.message}</div><span className="app-toast-timer" aria-hidden="true" /></div></div> : null}
+      {view.kind === 'scan' ? (
+        <div className="detail-toolbar">
+          <button type="button" className="scan-page-back" onClick={closeScanDetail}>← All scans</button>
+          <button type="button" className="global-logout" onClick={logout}>Sign out</button>
+        </div>
+      ) : view.kind === 'project' ? (
+        <div className="detail-toolbar">
+          <button type="button" className="project-back-link" onClick={closeProjectDetail}>← All projects</button>
+          <button type="button" className="global-logout" onClick={logout}>Sign out</button>
+        </div>
+      ) : null}
       {showDashboard ? (
         <div className="home-layout">
           <aside className="home-sidebar">
@@ -423,11 +703,14 @@ export default function App() {
               <h1>Everything looks better when quality is visible.</h1>
               <p>Monitor site health, launch intelligent scans, and turn every finding into a clear next step.</p>
             </div>
-            <div className={`system-chip ${loading ? 'system-chip-live' : ''}`}>
-              <span className="system-chip-dot" />
-              <div>
-                <small>System status</small>
-                <strong>{loading ? 'Scan running' : 'All systems operational'}</strong>
+            <button type="button" className="global-logout dashboard-logout" onClick={logout}>Sign out</button>
+            <div className="dashboard-header-actions">
+              <div className={`system-chip ${loading ? 'system-chip-live' : ''}`}>
+                <span className="system-chip-dot" />
+                <div>
+                  <small>System status</small>
+                  <strong>{loading ? 'Scan running' : 'All systems operational'}</strong>
+                </div>
               </div>
             </div>
           </header>
@@ -653,6 +936,7 @@ export default function App() {
 
                 <details className="completed-raw-report">
                   <summary><span><span className="eyebrow">Technical output</span><strong>{liveOutcome === 'stopped' ? 'Partial raw report' : 'Complete raw report'}</strong></span><span>View output <i aria-hidden="true">⌄</i></span></summary>
+                  <div className="report-toolbar"><button type="button" className="secondary compact-button" onClick={() => downloadReport(report, `scan-report-${completedScan?.id ?? 'latest'}.txt`)}>↓ Export report</button></div>
                   <pre>{report}</pre>
                 </details>
               </section>
@@ -661,41 +945,27 @@ export default function App() {
 
           <section className="home-grid">
             <div className="panel fixed-panel">
-              <div className="panel-header">
-                <h2>Projects</h2>
-                <span>{projects.length}</span>
-              </div>
+              <div className="panel-header"><div><h2>Projects</h2><small>{filteredProjects.length} matching</small></div><span>{projects.length}</span></div>
+              <div className="list-tools"><input value={projectQuery} onChange={(event) => setProjectQuery(event.target.value)} placeholder="Search projects" aria-label="Search projects" /></div>
               <ul className="list scroll-list">
-                {projects.map((project) => (
+                {visibleProjects.map((project) => (
                   <li key={project.id} onClick={() => openProject(project.id)} className="clickable">
-                    <div className="list-row-top">
-                      <strong>{project.name}</strong>
-                      <span className="list-badge">Project</span>
-                    </div>
-                    <span>{project.base_url}</span>
+                    <div className="list-row-top"><strong>{project.name}</strong><span className="list-badge">Project</span></div><span>{project.base_url}</span>
                   </li>
                 ))}
               </ul>
+              <div className="list-pagination"><span>Page {projectPage} of {projectPageCount}</span><div><button type="button" disabled={projectPage <= 1} onClick={() => setProjectPage((page) => page - 1)}>←</button><button type="button" disabled={projectPage >= projectPageCount} onClick={() => setProjectPage((page) => page + 1)}>→</button></div></div>
             </div>
 
             <div className="panel fixed-panel">
-              <div className="panel-header">
-                <h2>Scans</h2>
-                <span>{scans.length}</span>
-              </div>
+              <div className="panel-header"><div><h2>Scans</h2><small>{filteredScans.length} matching</small></div><span>{scans.length}</span></div>
+              <div className="list-tools"><input value={scanQuery} onChange={(event) => setScanQuery(event.target.value)} placeholder="Search scans" aria-label="Search scans" /><select value={scanStatusFilter} onChange={(event) => setScanStatusFilter(event.target.value)} aria-label="Filter scans by status"><option value="all">All statuses</option><option value="completed">Completed</option><option value="stopped">Stopped</option><option value="failed">Failed</option><option value="running">Running</option></select></div>
               <ul className="list scroll-list">
-                {scans.map((scan) => (
-                  <li key={scan.id} onClick={() => openScan(scan.id)} className="clickable">
-                    <div className="list-row-top">
-                      <strong>{scan.url}</strong>
-                      <span className={`list-badge list-badge-score ${scan.site_score >= 90 ? 'list-badge-good' : scan.site_score >= 70 ? 'list-badge-warn' : 'list-badge-alert'}`}>
-                        {scan.site_score}/100
-                      </span>
-                    </div>
-                    <span>{scan.status} · {scan.pages_tested} pages · {scan.total_findings} findings · unique {scan.unique_findings}</span>
-                  </li>
+                {visibleScans.map((scan) => (
+                  <li key={scan.id} onClick={() => openScan(scan.id)} className="clickable"><div className="list-row-top"><strong>{scan.url}</strong><span className={`list-badge list-badge-score ${scan.site_score >= 90 ? 'list-badge-good' : scan.site_score >= 70 ? 'list-badge-warn' : 'list-badge-alert'}`}>{scan.site_score}/100</span></div><span>{scan.status} · {scan.pages_tested} pages · {scan.total_findings} findings · unique {scan.unique_findings}</span></li>
                 ))}
               </ul>
+              <div className="list-pagination"><span>Page {scanPage} of {scanPageCount}</span><div><button type="button" disabled={scanPage <= 1} onClick={() => setScanPage((page) => page - 1)}>←</button><button type="button" disabled={scanPage >= scanPageCount} onClick={() => setScanPage((page) => page + 1)}>→</button></div></div>
             </div>
           </section>
           </main>
@@ -706,7 +976,6 @@ export default function App() {
         <section className="scan-page">
           <header className="scan-page-hero">
             <div className="scan-page-topline">
-              <button className="scan-page-back" onClick={closeScanDetail}>← All scans</button>
               <span className={`scan-state ${selectedScan?.status === 'completed' ? 'scan-state-complete' : selectedScan?.status === 'stopped' ? 'scan-state-stopped' : 'scan-state-running'}`}>
                 <i /> {selectedScan?.status ?? (scanLoading ? 'Loading' : 'Unavailable')}
               </span>
@@ -805,7 +1074,7 @@ export default function App() {
                         <div><span>Unique</span><strong>{selectedScan.unique_findings}</strong></div>
                         <div><span>Missing UI</span><strong>{selectedScan.missing_elements}</strong></div>
                         <div><span>Third party</span><strong>{selectedScan.third_party_failures}</strong></div>
-                        <div><span>Artifacts</span><strong>{selectedScan.artifacts.length}</strong></div>
+                        <div><span>Page URLs</span><strong>{selectedScanTestedPages.length}</strong></div>
                       </div>
                     </div>
                   </div>
@@ -872,15 +1141,16 @@ export default function App() {
                   ) : <p className="scan-support-empty">No previous scan is available for comparison.</p>}
                 </article>
                 <article className="scan-page-card">
-                  <div className="scan-page-card-heading"><div><p className="eyebrow">Evidence files</p><h2>Artifacts</h2></div><span className="scan-quality-label">{selectedScan?.artifacts.length ?? 0}</span></div>
-                  {selectedScan?.artifacts.length ? (
-                    <ul className="scan-artifact-list">{selectedScan.artifacts.map((artifact) => <li key={artifact.id}><span>{artifact.kind}</span><strong>{artifact.path}</strong></li>)}</ul>
-                  ) : <p className="scan-support-empty">No screenshots or recordings were saved for this scan.</p>}
+                  <div className="scan-page-card-heading"><div><p className="eyebrow">Coverage</p><h2>Tested pages</h2></div><span className="scan-quality-label">{selectedScanTestedPages.length}</span></div>
+                  {selectedScanTestedPages.length ? (
+                    <ul className="scan-tested-page-list">{selectedScanTestedPages.map((pageUrl, index) => <li key={`${index}-${pageUrl}`}><span>{String(index + 1).padStart(2, '0')}</span><a href={pageUrl} target="_blank" rel="noreferrer">{pageUrl}</a></li>)}</ul>
+                  ) : <p className="scan-support-empty">No tested page URLs were stored for this scan.</p>}
                 </article>
               </div>
 
               <details className="scan-page-card scan-raw-card">
                 <summary><span><span className="eyebrow">Technical output</span><strong>Raw scan report</strong></span><span>View full output <i aria-hidden="true">⌄</i></span></summary>
+                <div className="report-toolbar"><button type="button" className="secondary compact-button" onClick={() => downloadReport(selectedScan?.raw_report, `scan-report-${selectedScan?.id ?? view.id}.txt`)}>↓ Export report</button></div>
                 {selectedScan?.raw_report ? <pre>{selectedScan.raw_report}</pre> : <p className="scan-support-empty">No raw report was stored for this scan.</p>}
               </details>
             </div>
@@ -892,7 +1162,6 @@ export default function App() {
         <section className="project-page">
           <header className="project-hero">
             <div className="project-hero-topline">
-              <button className="project-back-link" onClick={closeProjectDetail}>← All projects</button>
               <span className={`project-health ${projectLatestScan && projectLatestScan.site_score >= 90 ? 'project-health-good' : projectLatestScan && projectLatestScan.site_score >= 70 ? 'project-health-warn' : 'project-health-alert'}`}>
                 <i /> {projectLatestScan ? projectLatestScan.risk_level : 'Awaiting first scan'}
               </span>
@@ -1028,7 +1297,7 @@ export default function App() {
                 {projectScans.length ? (
                   <div className="project-scan-table">
                     <div className="project-scan-table-head"><span>Assessment</span><span>Health</span><span>Coverage</span><span>Started</span><span /></div>
-                    {projectScans.map((scan) => (
+                    {visibleProjectScans.map((scan) => (
                       <button key={scan.id} className="project-scan-row" onClick={() => openScan(scan.id)}>
                         <span><strong>Scan #{scan.id}</strong><small>{scan.status}</small></span>
                         <span><strong>{scan.site_score}/100</strong><small>{scan.risk_level}</small></span>
@@ -1041,6 +1310,15 @@ export default function App() {
                 ) : (
                   <div className="project-empty-state compact-empty"><p>No scan history is available for this project.</p></div>
                 )}
+                {projectScans.length ? (
+                  <div className="project-history-pagination">
+                    <span>Page {projectHistoryPage} of {projectHistoryPageCount}</span>
+                    <div>
+                      <button type="button" disabled={projectHistoryPage <= 1} onClick={() => setProjectHistoryPage((page) => page - 1)} aria-label="Previous scan history page">←</button>
+                      <button type="button" disabled={projectHistoryPage >= projectHistoryPageCount} onClick={() => setProjectHistoryPage((page) => page + 1)} aria-label="Next scan history page">→</button>
+                    </div>
+                  </div>
+                ) : null}
               </article>
             </div>
           </section>

@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import threading
 import queue
+import time
+import os
+import secrets
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request as URLRequest, urlopen
 import sys
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy.orm import Session
 
@@ -25,7 +30,10 @@ from qa_platform.reporting import format_raw_report  # noqa: E402
 from qa_platform.scanner import Phase1Tester  # noqa: E402
 
 from .db import SessionLocal, init_db  # noqa: E402
-from .orm_models import Artifact, Finding as ORMFinding, Project, Scan  # noqa: E402
+from .orm_models import Artifact, Finding as ORMFinding, PendingSignup, Project, Scan, User  # noqa: E402
+from .security import create_access_token, get_current_user, hash_password, validate_public_url, verify_password  # noqa: E402
+from .email_service import PASSWORD_RESET_TTL_HOURS, create_verification_token, hash_verification_token, send_password_reset_email, send_verification_email  # noqa: E402
+
 
 
 app = FastAPI(
@@ -36,7 +44,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,6 +58,21 @@ _live_scan_state: dict[str, object] = {
     "context": None,
     "page": None,
 }
+_rate_limit_lock = threading.Lock()
+_rate_limit_hits: dict[tuple[int, str], list[float]] = {}
+_google_states: dict[str, float] = {}
+
+
+def _enforce_rate_limit(user: User, bucket: str, limit: int = 5, window_seconds: int = 60) -> None:
+    now = time.monotonic()
+    key = (user.id, bucket)
+    with _rate_limit_lock:
+        hits = [stamp for stamp in _rate_limit_hits.get(key, []) if now - stamp < window_seconds]
+        if len(hits) >= limit:
+            retry_after = max(1, int(window_seconds - (now - hits[0])))
+            raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Try again in {retry_after} seconds.", headers={"Retry-After": str(retry_after)})
+        hits.append(now)
+        _rate_limit_hits[key] = hits
 
 
 def _update_live_scan_runtime(**kwargs) -> None:
@@ -75,6 +98,41 @@ class ScanResponse(BaseModel):
 
 class ScanLiveRequest(ScanRequest):
     pass
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    email: str
+    token: str
+    password: str
+
+
+class EmailRequest(BaseModel):
+    email: str
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user_id: int
+    email: str
+
+
+class MessageResponse(BaseModel):
+    message: str
 
 
 class HealthResponse(BaseModel):
@@ -400,7 +458,7 @@ def health() -> HealthResponse:
 
 
 @app.post("/scan", response_model=ScanResponse)
-def scan(request: ScanRequest) -> ScanResponse:
+def scan(request: ScanRequest, user: User = Depends(get_current_user)) -> ScanResponse:
     browser_mode = "browser" if request.mode == "browser-fast" else request.mode
     db = SessionLocal()
     try:
@@ -421,7 +479,9 @@ def scan(request: ScanRequest) -> ScanResponse:
 
 
 @app.post("/scan/live")
-def scan_live(request: ScanLiveRequest) -> StreamingResponse:
+def scan_live(request: ScanLiveRequest, user: User = Depends(get_current_user)) -> StreamingResponse:
+    _enforce_rate_limit(user, "scan_live")
+    validate_public_url(str(request.url))
     events: queue.Queue[object] = queue.Queue()
     done = object()
     stop_event = threading.Event()
@@ -462,7 +522,7 @@ def scan_live(request: ScanLiveRequest) -> StreamingResponse:
             events.put({"type": "done", "report": format_raw_report(report), "scan_id": scan_id})
         except Exception as exc:
             db.rollback()
-            stopped = str(exc) == "Scan stopped"
+            stopped = stop_event.is_set() or str(exc) == "Scan stopped"
             partial_report = tester.partial_report() if tester is not None else None
             try:
                 scan_record = db.get(Scan, scan_id) if scan_id is not None else None
@@ -519,7 +579,7 @@ def scan_live(request: ScanLiveRequest) -> StreamingResponse:
 
 
 @app.post("/scan/live/stop")
-def stop_live_scan() -> dict[str, str]:
+def stop_live_scan(user: User = Depends(get_current_user)) -> dict[str, str]:
     with _live_scan_lock:
         stop_event = _live_scan_state.get("stop_event")
         active = bool(_live_scan_state.get("active"))
@@ -538,13 +598,226 @@ def stop_live_scan() -> dict[str, str]:
     return {"status": "stopping"}
 
 
+@app.post("/auth/register", response_model=MessageResponse)
+def register(request: RegisterRequest) -> MessageResponse:
+    email = request.email.strip().lower()
+    if "@" not in email or len(email) > 320:
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    if len(request.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    token, token_hash, expires_at = create_verification_token()
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.email == email).one_or_none()
+        if existing is not None:
+            if existing.email_verified:
+                raise HTTPException(status_code=409, detail="An account with that email already exists")
+            # Migrate an account created by the earlier flow into pending signup.
+            pending = db.query(PendingSignup).filter(PendingSignup.email == email).one_or_none()
+            if pending is None:
+                pending = PendingSignup(email=email, password_hash=existing.password_hash, verification_token_hash=token_hash, verification_expires_at=expires_at)
+                db.add(pending)
+            else:
+                pending.password_hash = existing.password_hash
+                pending.verification_token_hash = token_hash
+                pending.verification_expires_at = expires_at
+            db.delete(existing)
+        else:
+            pending = db.query(PendingSignup).filter(PendingSignup.email == email).one_or_none()
+            if pending is None:
+                pending = PendingSignup(email=email, password_hash=hash_password(request.password), verification_token_hash=token_hash, verification_expires_at=expires_at)
+                db.add(pending)
+            else:
+                pending.password_hash = hash_password(request.password)
+                pending.verification_token_hash = token_hash
+                pending.verification_expires_at = expires_at
+        db.commit()
+        try:
+            send_verification_email(email, token)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Verification email could not be sent: {exc}")
+        return MessageResponse(message="Verification email sent. Your account will be created after confirmation.")
+    finally:
+        db.close()
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(request: LoginRequest) -> AuthResponse:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == request.email.strip().lower()).one_or_none()
+        if user is None or not verify_password(request.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        if not user.email_verified:
+            raise HTTPException(status_code=403, detail="Please verify your email before signing in")
+        return AuthResponse(access_token=create_access_token(user), user_id=user.id, email=user.email)
+    finally:
+        db.close()
+
+
+@app.post("/auth/resend-verification", response_model=MessageResponse)
+def resend_verification(request: EmailRequest) -> MessageResponse:
+    email = request.email.strip().lower()
+    db = SessionLocal()
+    try:
+        pending = db.query(PendingSignup).filter(PendingSignup.email == email).one_or_none()
+        if pending is None:
+            return MessageResponse(message="If that email has a pending signup, a new verification email has been sent.")
+        token, token_hash, expires_at = create_verification_token()
+        pending.verification_token_hash = token_hash
+        pending.verification_expires_at = expires_at
+        db.commit()
+        try:
+            send_verification_email(email, token)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Verification email could not be sent: {exc}")
+        return MessageResponse(message="If that email has a pending signup, a new verification email has been sent.")
+    finally:
+        db.close()
+
+
+@app.post("/auth/forgot-password", response_model=MessageResponse)
+def forgot_password(request: PasswordResetRequest) -> MessageResponse:
+    email = request.email.strip().lower()
+    message = "If an account exists for that email, a password reset link has been sent."
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email, User.is_active.is_(True), User.email_verified.is_(True)).one_or_none()
+        if user is None:
+            return MessageResponse(message=message)
+        token, token_hash, _ = create_verification_token()
+        user.password_reset_token_hash = token_hash
+        user.password_reset_expires_at = datetime.utcnow() + timedelta(hours=PASSWORD_RESET_TTL_HOURS)
+        db.commit()
+        try:
+            send_password_reset_email(email, token)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Password reset email could not be sent: {exc}")
+        return MessageResponse(message=message)
+    finally:
+        db.close()
+
+
+@app.post("/auth/reset-password", response_model=MessageResponse)
+def reset_password(request: PasswordResetConfirmRequest) -> MessageResponse:
+    email = request.email.strip().lower()
+    if len(request.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email, User.is_active.is_(True)).one_or_none()
+        now = datetime.utcnow()
+        if user is None or user.password_reset_expires_at is None or user.password_reset_expires_at < now or user.password_reset_token_hash != hash_verification_token(request.token):
+            raise HTTPException(status_code=400, detail="This password reset link is invalid or expired")
+        user.password_hash = hash_password(request.password)
+        user.password_reset_token_hash = None
+        user.password_reset_expires_at = None
+        db.commit()
+        return MessageResponse(message="Your password has been reset. You can now sign in.")
+    finally:
+        db.close()
+
+
+@app.get("/auth/verify-email")
+def verify_email(email: str, token: str):
+    frontend_url = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173").rstrip("/")
+    db = SessionLocal()
+    try:
+        pending = db.query(PendingSignup).filter(PendingSignup.email == email.strip().lower()).one_or_none()
+        now = datetime.utcnow()
+        if pending is None or pending.verification_expires_at < now or pending.verification_token_hash != hash_verification_token(token):
+            raise HTTPException(status_code=400, detail="This verification link is invalid or expired")
+        user = User(email=pending.email, password_hash=pending.password_hash, email_verified=True)
+        db.add(user)
+        db.delete(pending)
+        db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(f"{frontend_url}/#verified=1")
+
+
+@app.get("/auth/google")
+def google_login() -> dict[str, str]:
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/auth/google/callback").strip()
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Google sign-in is not configured")
+    state = secrets.token_urlsafe(32)
+    _google_states[state] = time.time() + 600
+    query = urlencode({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "online",
+        "state": state,
+        "prompt": "select_account",
+    })
+    return {"authorization_url": f"https://accounts.google.com/o/oauth2/v2/auth?{query}"}
+
+
+@app.get("/auth/google/callback")
+def google_callback(code: str, state: str):
+    frontend_url = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173").rstrip("/")
+    expires_at = _google_states.pop(state, 0)
+    if not expires_at or expires_at < time.time():
+        raise HTTPException(status_code=400, detail="Invalid or expired Google sign-in state")
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/auth/google/callback").strip()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=503, detail="Google sign-in is not configured")
+    token_request = URLRequest(
+        "https://oauth2.googleapis.com/token",
+        data=urlencode({"code": code, "client_id": client_id, "client_secret": client_secret, "redirect_uri": redirect_uri, "grant_type": "authorization_code"}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(token_request, timeout=10) as response:
+            token_payload = json.loads(response.read().decode())
+        id_token = token_payload.get("id_token")
+        if not id_token:
+            raise ValueError("Google did not return an identity token")
+        with urlopen(f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}", timeout=10) as response:
+            profile = json.loads(response.read().decode())
+        if profile.get("aud") != client_id or profile.get("email_verified") != "true":
+            raise ValueError("Google identity could not be verified")
+        email = str(profile.get("email", "")).strip().lower()
+        if not email:
+            raise ValueError("Google account has no verified email")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Google sign-in failed: {exc}")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email).one_or_none()
+        if user is None:
+            user = User(email=email, password_hash=hash_password(secrets.token_urlsafe(32)), email_verified=True)
+            db.add(user)
+        elif not user.email_verified:
+            user.email_verified = True
+            user.verification_token_hash = None
+            user.verification_expires_at = None
+        db.commit()
+        db.refresh(user)
+        token = create_access_token(user)
+    finally:
+        db.close()
+    return RedirectResponse(f"{frontend_url}/#oauth_token={token}")
+
+
+@app.get("/auth/me", response_model=AuthResponse)
+def auth_me(user: User = Depends(get_current_user)) -> AuthResponse:
+    return AuthResponse(access_token="", user_id=user.id, email=user.email)
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {"message": "Autonomous QA backend is running"}
 
 
 @app.get("/projects", response_model=list[ProjectResponse])
-def list_projects() -> list[ProjectResponse]:
+def list_projects(user: User = Depends(get_current_user)) -> list[ProjectResponse]:
     db = SessionLocal()
     try:
         projects = db.query(Project).order_by(Project.created_at.asc()).all()
@@ -554,7 +827,7 @@ def list_projects() -> list[ProjectResponse]:
 
 
 @app.get("/scans", response_model=list[ScanSummaryResponse])
-def list_scans() -> list[ScanSummaryResponse]:
+def list_scans(user: User = Depends(get_current_user)) -> list[ScanSummaryResponse]:
     db = SessionLocal()
     try:
         scans = db.query(Scan).order_by(Scan.started_at.asc()).all()
@@ -564,7 +837,7 @@ def list_scans() -> list[ScanSummaryResponse]:
 
 
 @app.get("/scans/{scan_id}", response_model=ScanDetailResponse)
-def get_scan(scan_id: int) -> ScanDetailResponse:
+def get_scan(scan_id: int, user: User = Depends(get_current_user)) -> ScanDetailResponse:
     db = SessionLocal()
     try:
         scan = db.query(Scan).filter(Scan.id == scan_id).one_or_none()
@@ -587,7 +860,7 @@ def get_scan(scan_id: int) -> ScanDetailResponse:
 
 
 @app.get("/projects/{project_id}/scans", response_model=list[ScanSummaryResponse])
-def list_project_scans(project_id: int) -> list[ScanSummaryResponse]:
+def list_project_scans(project_id: int, user: User = Depends(get_current_user)) -> list[ScanSummaryResponse]:
     db = SessionLocal()
     try:
         project = db.query(Project).filter(Project.id == project_id).one_or_none()

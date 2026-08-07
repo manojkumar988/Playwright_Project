@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from tempfile import NamedTemporaryFile
 import threading
+import ipaddress
+import socket
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
@@ -25,6 +27,8 @@ MAX_ACTIONS_PER_PAGE = 8
 SLOW_PAGE_THRESHOLD_SECONDS = 3.0
 POST_NAVIGATION_PAUSE_MS = 150
 POPUP_DISMISS_TRIES = 2
+ACTION_TIMEOUT_MS = 1500
+POPUP_WAIT_TIMEOUT_MS = 700
 POPUP_DISMISS_SELECTORS = [
     'button:has-text("Accept")',
     'button:has-text("Accept all")',
@@ -153,10 +157,11 @@ class Phase1Tester:
 
     def _dismiss_interruptions(self, page: Page) -> bool:
         dismissed = False
+        self._raise_if_stopped()
         try:
             page.mouse.click(8, 8)
         except Exception:
-            pass
+            self._raise_if_stopped()
 
         scopes: list[tuple[str, object]] = [("page", page)]
         try:
@@ -164,28 +169,31 @@ class Phase1Tester:
             for index, frame in enumerate(frames[1:], start=1):
                 scopes.append((f"frame-{index}", frame))
         except Exception:
-            pass
+            self._raise_if_stopped()
 
         for _ in range(POPUP_DISMISS_TRIES):
+            self._raise_if_stopped()
             if self._page_is_closed(page):
                 return dismissed
             dismissed_this_round = False
             for scope_name, scope in scopes:
                 for selector in POPUP_DISMISS_SELECTORS:
+                    self._raise_if_stopped()
                     try:
                         locator = scope.locator(selector).first
                         if locator.count() == 0 or not locator.is_visible():
                             continue
-                        locator.click(timeout=1200, force=True)
+                        locator.click(timeout=ACTION_TIMEOUT_MS, force=True)
                         dismissed = True
                         dismissed_this_round = True
                         self._log(f"[browser] Dismissed interruption ({scope_name}): {selector}")
                         try:
                             page.wait_for_timeout(200)
                         except Exception:
-                            pass
+                            self._raise_if_stopped()
                         break
                     except Exception:
+                        self._raise_if_stopped()
                         continue
                 if dismissed_this_round:
                     break
@@ -314,6 +322,8 @@ class Phase1Tester:
                         page.wait_for_timeout(POST_NAVIGATION_PAUSE_MS)
                     except Exception:
                         pass
+                    if self._is_http_url(page.url) and not self._is_public_http_url(page.url):
+                        raise RuntimeError("Blocked redirect to a private or internal network target")
                     self._dismiss_interruptions(page)
                     if not self.fast_browser:
                         self._log(f"[browser] Scrolling page: {normalized}")
@@ -365,8 +375,8 @@ class Phase1Tester:
                     if response and response.status >= 400:
                         self._capture_error_screenshot(page, normalized, f"http-{response.status}")
                 except Exception as exc:
-                    if str(exc) == "Scan stopped":
-                        raise
+                    if self._should_stop() or str(exc) == "Scan stopped":
+                        raise RuntimeError("Scan stopped")
                     self._log(f"[browser] Error on {normalized}: {exc}")
                     if self._page_is_closed(page):
                         recovered = self._recover_scan_page(browser, context, console_errors, network_errors)
@@ -608,8 +618,8 @@ class Phase1Tester:
                     return
                 count += 1
             except Exception as exc:
-                if str(exc) == "Scan stopped":
-                    raise
+                if self._should_stop() or str(exc) == "Scan stopped":
+                    raise RuntimeError("Scan stopped")
                 restored = False
                 try:
                     if not self._page_is_closed(page) and self._strip_fragment(page.url) != self._strip_fragment(current_url):
@@ -632,10 +642,12 @@ class Phase1Tester:
                 )
     def _restore_page_url(self, page: Page, current_url: str) -> bool:
         expected_url = self._strip_fragment(current_url)
+        self._raise_if_stopped()
         try:
             if self._strip_fragment(page.url) == expected_url:
                 return True
         except Exception:
+            self._raise_if_stopped()
             return False
 
         restore_attempts = [
@@ -643,6 +655,7 @@ class Phase1Tester:
             ("goto", getattr(page, "goto", None)),
         ]
         for method, operation in restore_attempts:
+            self._raise_if_stopped()
             if not callable(operation):
                 continue
             try:
@@ -656,15 +669,19 @@ class Phase1Tester:
                         operation(current_url, wait_until="domcontentloaded", timeout=self.timeout_seconds * 1000)
                     except TypeError:
                         operation(current_url, wait_until="domcontentloaded")
+                self._raise_if_stopped()
                 try:
                     page.wait_for_timeout(POST_NAVIGATION_PAUSE_MS)
                 except Exception:
-                    pass
+                    self._raise_if_stopped()
                 if self._strip_fragment(page.url) == expected_url:
                     self._dismiss_interruptions(page)
                     return True
             except Exception as exc:
+                if self._should_stop():
+                    raise RuntimeError("Scan stopped")
                 self._log(f"[browser] Could not restore page with {method}: {exc}")
+        self._raise_if_stopped()
         self._log(f"[browser] Page restore failed; visible page is {getattr(page, 'url', 'unknown')}")
         return False
 
@@ -769,19 +786,27 @@ class Phase1Tester:
         return []
 
     def _click_and_capture_popup(self, page: Page, locator) -> Page | None:
+        self._raise_if_stopped()
         expect_popup = getattr(page, "expect_popup", None)
         if callable(expect_popup):
             try:
-                with expect_popup(timeout=self.timeout_seconds * 1000) as popup_info:
-                    locator.click(timeout=min(self.timeout_seconds * 1000, 5000), no_wait_after=True)
+                with expect_popup(timeout=POPUP_WAIT_TIMEOUT_MS) as popup_info:
+                    locator.click(timeout=ACTION_TIMEOUT_MS, no_wait_after=True)
+                self._raise_if_stopped()
                 popup = getattr(popup_info, "value", None)
                 return popup
             except Exception:
-                pass
+                self._raise_if_stopped()
         try:
-            locator.click(timeout=min(self.timeout_seconds * 1000, 5000), no_wait_after=True)
+            self._raise_if_stopped()
+            locator.click(timeout=ACTION_TIMEOUT_MS, no_wait_after=True)
         except Exception:
-            locator.evaluate("el => el.click()")
+            self._raise_if_stopped()
+            try:
+                locator.evaluate("el => el.click()", timeout=ACTION_TIMEOUT_MS)
+            except TypeError:
+                locator.evaluate("el => el.click()")
+            self._raise_if_stopped()
         return None
 
     @staticmethod
@@ -799,6 +824,7 @@ class Phase1Tester:
         return value.replace("\\", "\\\\").replace('"', '\\"')
 
     def _scroll_page(self, page: Page) -> None:
+        self._raise_if_stopped()
         self._log("[browser] Scroll start")
         page.evaluate(
             """
@@ -818,6 +844,7 @@ class Phase1Tester:
             }
             """
         )
+        self._raise_if_stopped()
         self._log("[browser] Scroll complete")
 
     def _capture_error_screenshot(self, page: Page, url: str, suffix: str) -> str:
@@ -909,6 +936,9 @@ class Phase1Tester:
         started = perf_counter()
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
+                final_url = response.geturl() if hasattr(response, "geturl") else url
+                if self._is_http_url(final_url) and not self._is_public_http_url(final_url):
+                    return _PageResult(url=url, status=None, duration_seconds=perf_counter() - started, html="", links=[], text="", error="Blocked redirect to a private or internal network target")
                 body = response.read().decode("utf-8", errors="replace")
                 status = response.status
         except HTTPError as exc:
@@ -1283,6 +1313,20 @@ class Phase1Tester:
     def _strip_fragment(url: str) -> str:
         parsed = urlparse(url)
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.params, parsed.query, ""))
+
+    @staticmethod
+    def _is_public_http_url(url: str) -> bool:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        hostname = parsed.hostname.rstrip(".").lower()
+        if hostname in {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"} or hostname.endswith((".localhost", ".local")):
+            return False
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(hostname, parsed.port or 80, type=socket.SOCK_STREAM)}
+        except socket.gaierror:
+            return False
+        return bool(addresses) and all(not (ipaddress.ip_address(address).is_private or ipaddress.ip_address(address).is_loopback or ipaddress.ip_address(address).is_link_local or ipaddress.ip_address(address).is_reserved or ipaddress.ip_address(address).is_multicast or ipaddress.ip_address(address).is_unspecified) for address in addresses)
 
     @staticmethod
     def _is_http_url(url: str) -> bool:

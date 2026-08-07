@@ -110,3 +110,16 @@ npm run build
 - Keep the CLI, backend, and frontend instructions in sync with the actual repo layout.
 - Update `.gitignore` when new generated files or local artifacts are introduced.
 - Prefer small, verifiable documentation changes when behavior does not change.
+
+## Security and production deployment
+
+Authentication is enabled for the dashboard and scan/project APIs. Create an account from the frontend, then confirm the verification link sent by SMTP before signing in. Set a strong `JWT_SECRET` in `.env`; the development fallback must not be used in production. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_FROM` for email confirmation. Set `BACKEND_URL` to the public backend address used in confirmation links. Google sign-ins are treated as verified. Scan endpoints are limited to five requests per user per minute, and scan URLs plus redirect destinations are checked against private and local network ranges.
+
+For HTTPS deployment, use the example `deploy/Caddyfile` with a real DNS name. Caddy obtains and renews TLS certificates automatically and proxies to the local Uvicorn process:
+
+```bash
+uvicorn backend.app:app --host 127.0.0.1 --port 8000
+caddy run --config deploy/Caddyfile
+```
+
+Set `CORS_ORIGINS` to the exact HTTPS frontend origin in production. For Google sign-in, create a Google OAuth web client and add `GOOGLE_REDIRECT_URI` as an authorized redirect URI, then set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `FRONTEND_URL`. For multiple backend processes, replace the in-memory rate limiter with Redis-backed limiting.
