@@ -10,7 +10,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from .models import Evidence, Finding, PageSummary, TestReport
@@ -23,7 +23,12 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 MAX_PAGES = 30
-MAX_ACTIONS_PER_PAGE = 8
+BROWSER_MAX_PAGES = 15
+MAX_ACTIONS_PER_PAGE = 2
+MAX_NEW_LINKS_PER_PAGE = 5
+MAX_LINKS_PER_TOP_SECTION = 2
+MAX_DEEP_LINKS_PER_TOP_SECTION = 1
+MIN_QUEUED_LINKS_TO_SKIP_ACTIONS = 3
 SLOW_PAGE_THRESHOLD_SECONDS = 3.0
 POST_NAVIGATION_PAUSE_MS = 150
 POPUP_DISMISS_TRIES = 2
@@ -67,6 +72,94 @@ IGNORED_FAILURE_MARKERS = (
     "net::err_blocked_by_client",
     "net::err_failed",
 )
+
+TRACKING_QUERY_PREFIXES = ("utm_",)
+TRACKING_QUERY_KEYS = {
+    "fbclid",
+    "gclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "igshid",
+    "ref",
+    "ref_src",
+    "source",
+    "spm",
+    "ved",
+    "ei",
+    "sig",
+    "sxsrf",
+}
+LOW_VALUE_PATH_PARTS = {
+    "setprefs",
+    "preferences",
+    "settings",
+    "locale",
+    "language",
+    "languages",
+    "translate",
+    "history",
+    "privacyadvisor",
+    "logout",
+    "signout",
+    "unsubscribe",
+}
+AUTH_ACTION_TEXT = {
+    "log in",
+    "login",
+    "sign in",
+    "signin",
+    "sign-in",
+    "sign up",
+    "signup",
+    "register",
+    "my account",
+    "account",
+}
+AUTH_PATH_PARTS = {
+    "account",
+    "accounts",
+    "auth",
+    "oauth",
+    "login",
+    "signin",
+    "sign-in",
+    "signup",
+    "register",
+    "sso",
+    "session",
+}
+AUTH_HOST_PARTS = {
+    "account",
+    "accounts",
+    "auth",
+    "login",
+    "signin",
+    "oauth",
+    "sso",
+    "identity",
+}
+LOW_VALUE_QUERY_KEYS = {"hl", "lang", "locale", "theme"}
+HIGH_VALUE_PATH_PARTS = {
+    "about",
+    "pricing",
+    "product",
+    "products",
+    "service",
+    "services",
+    "docs",
+    "documentation",
+    "contact",
+    "signup",
+    "register",
+    "cart",
+    "checkout",
+    "support",
+    "blog",
+    "careers",
+    "features",
+    "solutions",
+}
 IGNORED_CRAWL_EXTENSIONS = {
     ".css",
     ".js",
@@ -236,9 +329,10 @@ class Phase1Tester:
             report.pages_tested += 1
             report.tested_urls.append(normalized)
             if page.html:
-                for link in self._discover_links(base_url, page, seen):
-                    queue.append((link, normalized))
-                self._log(f"Discovered {len(queue)} queued pages after: {normalized}")
+                inserted = self._insert_next_links(queue, self._discover_links(base_url, page, seen), normalized, seen)
+                if inserted:
+                    self._log(f"Discovered {len(inserted)} new links on current page; queued next: {self._format_queue([(link, normalized) for link in inserted])}")
+                self._log(f"Queue now ({len(queue)}): {self._format_queue(queue)}")
 
         self._aggregate_counts(report)
         self._log("Crawl complete")
@@ -287,7 +381,7 @@ class Phase1Tester:
         page = self._open_scan_page(context, console_errors, network_errors)
         self._set_runtime(browser=browser, context=context, page=page)
         try:
-            while queue and len(seen) < MAX_PAGES:
+            while queue and len(seen) < BROWSER_MAX_PAGES:
                 self._raise_if_stopped()
                 if self._page_is_closed(page):
                     self._log("Browser page closed unexpectedly, recovering")
@@ -308,7 +402,7 @@ class Phase1Tester:
                 console_errors.clear()
                 network_errors.clear()
                 try:
-                    self._log(f"[browser] Visiting page {len(seen)}/{MAX_PAGES}: {normalized}")
+                    self._log(f"[browser] Visiting page {len(seen)}/{BROWSER_MAX_PAGES}: {normalized}")
                     started = perf_counter()
                     try:
                         response = page.goto(
@@ -359,19 +453,27 @@ class Phase1Tester:
                                 evidence=[self._capture_browser_evidence(page, normalized, note=error)],
                             )
                         )
-                    for link in dom_links + nav_links + links:
-                        if len(seen) + len(queue) >= MAX_PAGES:
-                            break
-                        if not self._is_crawlable_page(link):
-                            continue
-                        if link not in seen and link not in [item[0] for item in queue]:
-                            queue.append((link, normalized))
+                    inserted_links = self._insert_next_links(
+                        queue,
+                        [link for link in dom_links + nav_links + links if self._is_candidate_page_url(link, base_url)],
+                        normalized,
+                        seen,
+                    )
                     if dom_links or nav_links or links:
+                        if inserted_links:
+                            self._log(f"[browser] Added {len(inserted_links)} current-page links to run next: {self._format_queue([(link, normalized) for link in inserted_links])}")
+                        else:
+                            self._log("[browser] No new current-page links to add")
                         self._log(f"[browser] Queue now ({len(queue)}): {self._format_queue(queue)}")
                     action_links = [] if self.fast_browser else self._browser_action_links(page, base_url, normalized, clicked_seen)
-                    self._log(
-                        f"[browser] Clickable links on page ({len(action_links)}): {self._format_actions(action_links)}"
-                    )
+                    if action_links:
+                        self._log(f"[browser] Candidate actions ({len(action_links)}): {self._format_actions(action_links)}")
+                    else:
+                        self._log("[browser] Candidate actions (0): (none)")
+                    skip_actions = len(inserted_links) >= MIN_QUEUED_LINKS_TO_SKIP_ACTIONS
+                    if skip_actions:
+                        self._log(f"[browser] Added {len(inserted_links)} useful links; skipping extra action clicks on this page")
+                        action_links = []
                     if response and response.status >= 400:
                         self._capture_error_screenshot(page, normalized, f"http-{response.status}")
                 except Exception as exc:
@@ -560,21 +662,41 @@ class Phase1Tester:
     def _exercise_visible_actions(self, report: TestReport, context: BrowserContext, page: Page, current_url: str, actions, seen: Set[str], queue, base_url: str, clicked_seen: Set[str] | None = None) -> None:
         if clicked_seen is None:
             clicked_seen = set()
-        count = 0
+        clicked = 0
+        skipped_duplicate = 0
+        skipped_low_value = 0
+        skipped_unresolved = 0
+        click_failures = 0
+        seen_keys = {self._duplicate_key(url) for url in seen}
+
         for action in actions:
             self._raise_if_stopped()
-            if count >= MAX_ACTIONS_PER_PAGE:
+            if clicked >= MAX_ACTIONS_PER_PAGE:
                 break
             href = action.get("href")
             text = str(action.get("text") or "").strip()
             if not text or len(text) > 80:
+                skipped_low_value += 1
+                continue
+            queued_keys = {self._duplicate_key(item[0] if isinstance(item, tuple) else item) for item in queue}
+            href_key = self._duplicate_key(href) if isinstance(href, str) and self._is_http_url(href) else ""
+            if href_key and (href_key in queued_keys or href_key in seen_keys):
+                skipped_duplicate += 1
+                continue
+            if self._is_risky_action_link(href if isinstance(href, str) else None, text, base_url):
+                skipped_low_value += 1
+                continue
+            if isinstance(href, str) and not self._is_candidate_page_url(href, base_url):
+                skipped_low_value += 1
                 continue
             try:
-                self._log(f"[browser] Clicking link: {text} -> {href or 'unknown'}")
+                label = self._link_label(href or "", text)
+                self._log(f"[browser] Clicking link: {label}")
                 locator = self._resolve_action_locator(page, action, href, text)
                 if locator is None:
-                    self._log(f"[browser] Skipping unresolved link: {text}")
+                    skipped_unresolved += 1
                     continue
+                clicked += 1
                 self._dismiss_interruptions(page)
                 before_url = page.url
                 before_pages = self._context_pages(context)
@@ -594,53 +716,64 @@ class Phase1Tester:
                     except Exception:
                         pass
                 if self._page_is_closed(target_page):
-                    self._log(f"[browser] Target page closed while clicking: {text}")
+                    click_failures += 1
+                    self._focus_scan_page(page)
                     return
                 if not self.fast_browser:
                     self._scroll_page(target_page)
                 after_url = self._strip_fragment(target_page.url)
                 if after_url != before_url and self._is_http_url(after_url) and urlparse(after_url).netloc == urlparse(base_url).netloc:
-                    self._log(f"[browser] Click resolved to: {after_url}")
-                    queued_urls = {item[0] if isinstance(item, tuple) else item for item in queue}
-                    if after_url not in seen and after_url not in queued_urls:
-                        queue.append((after_url, current_url))
+                    self._log(f"[browser] Click resolved to: {self._link_label(after_url)}")
+                    queued_keys = {self._duplicate_key(item[0] if isinstance(item, tuple) else item) for item in queue}
+                    inserted = []
+                    if self._is_candidate_page_url(after_url, base_url) and self._duplicate_key(after_url) not in seen_keys and self._duplicate_key(after_url) not in queued_keys:
+                        inserted = self._insert_next_links(queue, [after_url], current_url, seen)
                     if after_url not in clicked_seen:
                         clicked_seen.add(after_url)
                         report.clicked_urls.append(after_url)
+                    if inserted:
+                        self._log(f"[browser] Added clicked destination to run next: {self._link_label(after_url)}")
                     self._log(f"[browser] Queue updated ({len(queue)}): {self._format_queue(queue)}")
                     if target_page is not page:
-                        try:
-                            target_page.close()
-                        except Exception:
-                            pass
+                        self._close_extra_page(target_page)
+                        self._focus_scan_page(page)
                     else:
-                        self._restore_page_url(page, current_url)
-                    return
-                count += 1
-            except Exception as exc:
-                if self._should_stop() or str(exc) == "Scan stopped":
+                        self._restore_page_url(page, current_url, quiet=True)
+                        self._focus_scan_page(page)
+                    break
+                if target_page is not page:
+                    self._close_extra_page(target_page)
+                    self._focus_scan_page(page)
+                elif self._strip_fragment(page.url) != self._strip_fragment(current_url):
+                    self._restore_page_url(page, current_url, quiet=True)
+                    self._focus_scan_page(page)
+            except Exception:
+                if self._should_stop():
                     raise RuntimeError("Scan stopped")
-                restored = False
+                click_failures += 1
                 try:
+                    for candidate in self._context_pages(context):
+                        if candidate is not page:
+                            self._close_extra_page(candidate)
                     if not self._page_is_closed(page) and self._strip_fragment(page.url) != self._strip_fragment(current_url):
-                        restored = self._restore_page_url(page, current_url)
+                        self._restore_page_url(page, current_url, quiet=True)
+                    self._focus_scan_page(page)
                 except Exception:
-                    restored = False
-                if restored:
-                    self._log(f"[browser] Recovered original page after click error: {current_url}")
-                if "Target page, context or browser has been closed" in str(exc):
-                    self._log(f"[browser] Click aborted because page closed: {text}")
-                    return
-                self._log(f"[browser] Click failed on {current_url}: {text} ({exc})")
-                report.findings.append(
-                    Finding(
-                        category="navigation_failure",
-                        message=f"Visible action failed on {current_url}: {text} ({exc})",
-                        url=current_url,
-                        evidence=[self.evidence_for_url(current_url, note=str(exc))],
-                    )
-                )
-    def _restore_page_url(self, page: Page, current_url: str) -> bool:
+                    pass
+                continue
+
+        if actions:
+            parts = [f"clicked {clicked}"]
+            if skipped_duplicate:
+                parts.append(f"skipped {skipped_duplicate} duplicate/queued")
+            if skipped_low_value:
+                parts.append(f"skipped {skipped_low_value} low-value")
+            if skipped_unresolved:
+                parts.append(f"skipped {skipped_unresolved} unresolved")
+            if click_failures:
+                parts.append(f"{click_failures} click attempts did not complete")
+            self._log(f"[browser] Action summary: {', '.join(parts)}")
+    def _restore_page_url(self, page: Page, current_url: str, quiet: bool = False) -> bool:
         expected_url = self._strip_fragment(current_url)
         self._raise_if_stopped()
         try:
@@ -680,9 +813,11 @@ class Phase1Tester:
             except Exception as exc:
                 if self._should_stop():
                     raise RuntimeError("Scan stopped")
-                self._log(f"[browser] Could not restore page with {method}: {exc}")
+                if not quiet:
+                    self._log(f"[browser] Could not restore page with {method}: {exc}")
         self._raise_if_stopped()
-        self._log(f"[browser] Page restore failed; visible page is {getattr(page, 'url', 'unknown')}")
+        if not quiet:
+            self._log(f"[browser] Page restore failed; visible page is {getattr(page, 'url', 'unknown')}")
         return False
 
     def _browser_action_links(self, page: Page, base_url: str, current_url: str, clicked_seen: Set[str]) -> list[dict]:
@@ -784,6 +919,45 @@ class Phase1Tester:
         if isinstance(pages, list):
             return list(pages)
         return []
+
+    def _close_extra_page(self, page: Page) -> None:
+        if self._page_is_closed(page):
+            return
+        try:
+            page.close()
+        except Exception:
+            self._raise_if_stopped()
+
+    def _focus_scan_page(self, page: Page) -> None:
+        if self._page_is_closed(page):
+            return
+        bring_to_front = getattr(page, "bring_to_front", None)
+        if callable(bring_to_front):
+            try:
+                bring_to_front()
+            except Exception:
+                self._raise_if_stopped()
+
+    def _is_risky_action_link(self, href: str | None, text: str, base_url: str) -> bool:
+        normalized_text = " ".join(text.lower().replace("_", " ").replace("-", " ").split())
+        compact_text = normalized_text.replace(" ", "")
+        if normalized_text in AUTH_ACTION_TEXT or compact_text in AUTH_ACTION_TEXT:
+            return True
+        if not href or not self._is_http_url(href):
+            return False
+        parsed = urlparse(href)
+        base_host = urlparse(base_url).netloc.lower()
+        host = parsed.netloc.lower()
+        host_parts = {part for part in host.replace("-", ".").split(".") if part}
+        path_parts = {part.lower() for part in parsed.path.replace("-", "/").replace("_", "/").split("/") if part}
+        if path_parts & AUTH_PATH_PARTS:
+            return True
+        if host != base_host and (host_parts & AUTH_HOST_PARTS):
+            return True
+        query_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        if {"client_id", "redirect_uri", "response_type"} & query_keys and (path_parts & {"oauth", "authorize", "auth"}):
+            return True
+        return False
 
     def _click_and_capture_popup(self, page: Page, locator) -> Page | None:
         self._raise_if_stopped()
@@ -913,23 +1087,73 @@ class Phase1Tester:
             return "resource_failure"
         return "api_failure"
 
+    def _insert_next_links(self, queue: list[tuple[str, str | None]], links: Iterable[str], parent_url: str, seen: Set[str]) -> list[str]:
+        queued_keys = {self._duplicate_key(item[0]) for item in queue}
+        seen_keys = {self._duplicate_key(url) for url in seen}
+        section_counts = self._section_counts([item[0] for item in queue] + list(seen))
+        inserted: list[str] = []
+        inserted_keys: set[str] = set()
+        remaining_slots = max(0, min(MAX_NEW_LINKS_PER_PAGE, MAX_PAGES - len(seen) - len(queue)))
+        for link in self._rank_links(links, parent_url):
+            if len(inserted) >= remaining_slots:
+                break
+            normalized = self._canonicalize_url(link)
+            key = self._duplicate_key(normalized)
+            if key in seen_keys or key in queued_keys or key in inserted_keys:
+                continue
+            if self._section_is_saturated(normalized, section_counts, parent_url):
+                continue
+            inserted.append(normalized)
+            inserted_keys.add(key)
+            section_counts[self._top_section(normalized)] = section_counts.get(self._top_section(normalized), 0) + 1
+        if inserted:
+            queue[0:0] = [(link, parent_url) for link in inserted]
+        return inserted
+
     def _discover_links(self, base_url: str, page: _PageResult, seen: Set[str]) -> list[str]:
         discovered: list[str] = []
+        discovered_keys: set[str] = set()
+        page_key = self._duplicate_key(page.url)
         for link in page.links:
             absolute = urljoin(page.url, link)
-            if not self._is_http_url(absolute) or not self._is_crawlable_page(absolute):
+            if not self._is_candidate_page_url(absolute, base_url):
                 continue
-            if urlparse(absolute).netloc != urlparse(base_url).netloc:
-                continue
-            normalized = self._strip_fragment(absolute)
-            if normalized != page.url and normalized not in seen and normalized not in discovered:
+            normalized = self._canonicalize_url(absolute)
+            key = self._duplicate_key(normalized)
+            if key != page_key and normalized not in seen and key not in discovered_keys:
                 discovered.append(normalized)
-        return discovered
+                discovered_keys.add(key)
+        return self._rank_links(discovered, page.url)
+
+    @staticmethod
+    def _top_section(url: str) -> str:
+        path_parts = [part.lower() for part in urlparse(url).path.strip("/").split("/") if part]
+        return path_parts[0] if path_parts else "__root__"
+
+    @staticmethod
+    def _path_depth(url: str) -> int:
+        return len([part for part in urlparse(url).path.strip("/").split("/") if part])
+
+    def _section_counts(self, urls: Iterable[str]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for url in urls:
+            section = self._top_section(url)
+            counts[section] = counts.get(section, 0) + 1
+        return counts
+
+    def _section_is_saturated(self, url: str, section_counts: dict[str, int], parent_url: str | None = None) -> bool:
+        section = self._top_section(url)
+        depth = self._path_depth(url)
+        if section == "__root__":
+            return False
+        parent_section = self._top_section(parent_url) if parent_url else "__root__"
+        limit = MAX_LINKS_PER_TOP_SECTION if section == parent_section else MAX_DEEP_LINKS_PER_TOP_SECTION if depth > 1 else MAX_LINKS_PER_TOP_SECTION
+        return section_counts.get(section, 0) >= limit
 
     @staticmethod
     def _duplicate_key(url: str) -> str:
-        parsed = urlparse(url)
-        return urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "", ""))
+        parsed = urlparse(Phase1Tester._canonicalize_url(url))
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip("/") or "/", "", parsed.query, ""))
 
     def _fetch_page(self, url: str) -> _PageResult:
         request = Request(url, headers={"User-Agent": "AutonomousQA/1.0"})
@@ -1290,6 +1514,81 @@ class Phase1Tester:
         return " ".join(word.capitalize() for word in words)
 
     @staticmethod
+    def _canonicalize_url(url: str) -> str:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        kept_query = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+            lowered = key.lower()
+            if lowered in TRACKING_QUERY_KEYS or any(lowered.startswith(prefix) for prefix in TRACKING_QUERY_PREFIXES):
+                continue
+            kept_query.append((key, value))
+        return urlunparse((parsed.scheme, parsed.netloc, path, "", urlencode(kept_query, doseq=True), ""))
+
+    def _is_candidate_page_url(self, url: str, base_url: str) -> bool:
+        if not self._is_http_url(url) or not self._is_crawlable_page(url):
+            return False
+        parsed = urlparse(url)
+        if parsed.netloc != urlparse(base_url).netloc:
+            return False
+        path_parts = {part.lower() for part in parsed.path.replace("-", "/").replace("_", "/").split("/") if part}
+        if path_parts & LOW_VALUE_PATH_PARTS:
+            return False
+        if path_parts & AUTH_PATH_PARTS:
+            return False
+        query_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        if query_keys and query_keys <= LOW_VALUE_QUERY_KEYS:
+            return False
+        canonical = self._canonicalize_url(url)
+        canonical_query_keys = {key.lower() for key, _ in parse_qsl(urlparse(canonical).query, keep_blank_values=True)}
+        if parsed.query and not canonical_query_keys and not (path_parts & HIGH_VALUE_PATH_PARTS):
+            return False
+        return True
+
+    def _rank_links(self, links: Iterable[str], parent_url: str | None = None) -> list[str]:
+        unique: dict[str, str] = {}
+        for link in links:
+            canonical = self._canonicalize_url(link)
+            unique.setdefault(self._duplicate_key(canonical), canonical)
+        parent_section = self._top_section(parent_url) if parent_url else "__root__"
+
+        def score(url: str) -> tuple[int, int, str]:
+            parsed = urlparse(url)
+            path_parts = {part.lower() for part in parsed.path.split("/") if part}
+            section = self._top_section(url)
+            value = 0
+            if path_parts & HIGH_VALUE_PATH_PARTS:
+                value -= 20
+            if parent_section != "__root__" and section == parent_section:
+                value -= 10
+            elif parent_section != "__root__" and section != parent_section:
+                value += 15
+            if parsed.query:
+                value += 6
+            depth = len(path_parts)
+            return (value, depth, url)
+
+        return sorted(unique.values(), key=score)
+
+    @staticmethod
+    def _link_label(url: str, text: str = "") -> str:
+        clean_text = " ".join(text.split())
+        parsed = urlparse(url)
+        path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if clean_text and len(clean_text) <= 48 and clean_text.lower() not in {"about", "products", "services", "learn more", "google", "home"}:
+            return clean_text
+        if not path_parts:
+            return clean_text or "Home"
+        useful_parts = path_parts[-2:] if len(path_parts) > 1 else path_parts
+        label = " / ".join(
+            " ".join(piece.capitalize() for piece in part.replace("-", " ").replace("_", " ").split())
+            for part in useful_parts
+        )
+        return label or clean_text or parsed.netloc
+
+    @staticmethod
     def _is_crawlable_page(url: str) -> bool:
         parsed = urlparse(url)
         path = (parsed.path or "/").lower()
@@ -1359,14 +1658,12 @@ class Phase1Tester:
         if not queue:
             return "(empty)"
         items = queue[:limit]
-        if len(queue) > limit:
-            items.append(f"... (+{len(queue) - limit} more)")
         formatted: list[str] = []
         for item in items:
-            if isinstance(item, tuple) and item:
-                formatted.append(str(item[0]))
-            else:
-                formatted.append(str(item))
+            url = item[0] if isinstance(item, tuple) and item else str(item)
+            formatted.append(Phase1Tester._link_label(str(url)))
+        if len(queue) > limit:
+            formatted.append(f"... (+{len(queue) - limit} more)")
         return " | ".join(formatted)
 
     @staticmethod
@@ -1377,9 +1674,9 @@ class Phase1Tester:
         for action in actions[:limit]:
             if not isinstance(action, dict):
                 continue
-            text = str(action.get("text") or "").strip() or "untitled"
-            href = str(action.get("href") or "").strip() or "unknown"
-            items.append(f"{text} -> {href}")
+            text = str(action.get("text") or "").strip()
+            href = str(action.get("href") or "").strip()
+            items.append(Phase1Tester._link_label(href, text))
         if len(actions) > limit:
             items.append(f"... (+{len(actions) - limit} more)")
         return " | ".join(items) if items else "(none)"

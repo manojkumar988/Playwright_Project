@@ -97,6 +97,10 @@ class _FakePlaywrightPage:
     def screenshot(self, path, full_page=True):
         Path(path).write_bytes(b"fake screenshot")
 
+    def bring_to_front(self):
+        self.was_brought_to_front = True
+        return None
+
     def close(self):
         self.closed = True
         return None
@@ -163,6 +167,124 @@ class Phase1ScaffoldTests(unittest.TestCase):
         self.assertGreaterEqual(report.broken_links, 1)
         self.assertGreaterEqual(report.total_findings, 1)
 
+    def test_crawl_policy_filters_utility_links_and_prioritizes_journeys(self) -> None:
+        pages = {
+            "https://demo-webshop.com/": """
+                <html><body>
+                  <a href='/pricing?utm_source=newsletter&ved=abc'>Pricing tracked</a>
+                  <a href='/setprefs?hl=hi&source=homepage'>Language</a>
+                  <a href='/preferences?hl=en'>Preferences</a>
+                  <a href='/history/privacyadvisor/search/unauth'>History</a>
+                  <a href='/logout'>Logout</a>
+                  <a href='/login'>Login</a>
+                  <a href='/signin'>Sign in</a>
+                  <a href='/account/signup?locality=us'>Signup</a>
+                  <a href='/oauth/authorize?client_id=abc&redirect_uri=/done'>OAuth</a>
+                  <a href='/products?utm_campaign=spring'>Products tracked</a>
+                  <a href='/about'>About</a>
+                  <a href='/contact?ref=footer'>Contact tracked</a>
+                  <a href='/blog?page=2'>Blog page</a>
+                  <a href='/support'>Support</a>
+                  <a href='/terms'>Terms</a>
+                </body></html>
+            """,
+            "https://demo-webshop.com/pricing": "<html><body>Pricing</body></html>",
+            "https://demo-webshop.com/products": "<html><body>Products</body></html>",
+            "https://demo-webshop.com/about": "<html><body>About</body></html>",
+            "https://demo-webshop.com/contact": "<html><body>Contact</body></html>",
+            "https://demo-webshop.com/support": "<html><body>Support</body></html>",
+        }
+
+        def fake_urlopen(request, timeout=10.0):
+            return _FakeResponse(pages.get(request.full_url, "<html><body>Fallback</body></html>"))
+
+        with patch("qa_platform.scanner.urlopen", side_effect=fake_urlopen):
+            report = Phase1Tester("https://demo-webshop.com", browser_mode="http").run()
+
+        self.assertEqual(
+            report.tested_urls[:6],
+            [
+                "https://demo-webshop.com/",
+                "https://demo-webshop.com/about",
+                "https://demo-webshop.com/contact",
+                "https://demo-webshop.com/pricing",
+                "https://demo-webshop.com/products",
+                "https://demo-webshop.com/support",
+            ],
+        )
+        self.assertNotIn("https://demo-webshop.com/setprefs", report.tested_urls)
+        self.assertNotIn("https://demo-webshop.com/preferences", report.tested_urls)
+        self.assertNotIn("https://demo-webshop.com/logout", report.tested_urls)
+        self.assertNotIn("https://demo-webshop.com/login", report.tested_urls)
+        self.assertNotIn("https://demo-webshop.com/signin", report.tested_urls)
+        self.assertNotIn("https://demo-webshop.com/account/signup?locality=us", report.tested_urls)
+        self.assertNotIn("https://demo-webshop.com/oauth/authorize?client_id=abc&redirect_uri=/done", report.tested_urls)
+        self.assertNotIn("https://demo-webshop.com/history/privacyadvisor/search/unauth", report.tested_urls)
+
+    def test_crawl_policy_limits_broad_section_expansion(self) -> None:
+        pages = {
+            "https://demo-webshop.com/": """
+                <html><body>
+                  <a href='/docs/about'>Docs</a>
+                  <a href='/maps/about'>Maps</a>
+                  <a href='/photos/about'>Photos</a>
+                  <a href='/pricing'>Pricing</a>
+                  <a href='/contact'>Contact</a>
+                </body></html>
+            """,
+            "https://demo-webshop.com/docs/about": """
+                <html><body>
+                  <a href='/docs/features'>Docs features</a>
+                  <a href='/docs/pricing'>Docs pricing</a>
+                  <a href='/docs/support'>Docs support</a>
+                  <a href='/maps/about'>Maps</a>
+                  <a href='/photos/about'>Photos</a>
+                </body></html>
+            """,
+            "https://demo-webshop.com/maps/about": "<html><body>Maps</body></html>",
+            "https://demo-webshop.com/photos/about": "<html><body>Photos</body></html>",
+            "https://demo-webshop.com/pricing": "<html><body>Pricing</body></html>",
+            "https://demo-webshop.com/contact": "<html><body>Contact</body></html>",
+            "https://demo-webshop.com/docs/features": "<html><body>Docs features</body></html>",
+            "https://demo-webshop.com/docs/pricing": "<html><body>Docs pricing</body></html>",
+            "https://demo-webshop.com/docs/support": "<html><body>Docs support</body></html>",
+        }
+
+        def fake_urlopen(request, timeout=10.0):
+            return _FakeResponse(pages.get(request.full_url, "<html><body>Fallback</body></html>"))
+
+        with patch("qa_platform.scanner.urlopen", side_effect=fake_urlopen):
+            report = Phase1Tester("https://demo-webshop.com", browser_mode="http").run()
+
+        docs_pages = [url for url in report.tested_urls if "/docs/" in url]
+        self.assertLessEqual(len(docs_pages), 2)
+        self.assertIn("https://demo-webshop.com/pricing", report.tested_urls)
+        self.assertIn("https://demo-webshop.com/contact", report.tested_urls)
+
+    def test_current_page_links_are_prioritized_before_older_queue_items(self) -> None:
+        pages = {
+            "https://demo-webshop.com/": "<html><body><a href='/a'>A</a><a href='/b'>B</a></body></html>",
+            "https://demo-webshop.com/a": "<html><body><a href='/a/child'>A child</a></body></html>",
+            "https://demo-webshop.com/a/child": "<html><body><h1>A child</h1></body></html>",
+            "https://demo-webshop.com/b": "<html><body><h1>B</h1></body></html>",
+        }
+
+        def fake_urlopen(request, timeout=10.0):
+            return _FakeResponse(pages[request.full_url])
+
+        with patch("qa_platform.scanner.urlopen", side_effect=fake_urlopen):
+            report = Phase1Tester("https://demo-webshop.com", browser_mode="http").run()
+
+        self.assertEqual(
+            report.tested_urls[:4],
+            [
+                "https://demo-webshop.com/",
+                "https://demo-webshop.com/a",
+                "https://demo-webshop.com/a/child",
+                "https://demo-webshop.com/b",
+            ],
+        )
+
     def test_stopped_scan_retains_partial_report(self) -> None:
         stop_event = threading.Event()
 
@@ -193,6 +315,26 @@ class Phase1ScaffoldTests(unittest.TestCase):
         self.assertGreaterEqual(len(report.recordings), 1)
         self.assertGreaterEqual(report.total_findings, 1)
 
+    def test_browser_action_skips_auth_links(self) -> None:
+        tester = Phase1Tester("https://demo-webshop.com", browser_mode="browser")
+        page = _FakePlaywrightPage("https://demo-webshop.com/")
+        report = TestReport(target_url="https://demo-webshop.com")
+
+        with patch.object(Phase1Tester, "_page_is_closed", return_value=False):
+            tester._exercise_visible_actions(
+                report=report,
+                context=type("Ctx", (), {"pages": lambda self=None: [page]})(),
+                page=page,
+                current_url="https://demo-webshop.com/",
+                actions=[{"kind": "link", "text": "Sign in", "href": "https://demo-webshop.com/login"}],
+                seen=set(),
+                queue=[],
+                base_url="https://demo-webshop.com/",
+            )
+
+        self.assertEqual(page.url, "https://demo-webshop.com/")
+        self.assertEqual(report.clicked_urls, [])
+
     def test_browser_action_restores_same_page_after_same_tab_navigation(self) -> None:
         tester = Phase1Tester("https://demo-webshop.com", browser_mode="browser")
         page = _FakePlaywrightPage("https://demo-webshop.com/")
@@ -206,13 +348,38 @@ class Phase1ScaffoldTests(unittest.TestCase):
                             context=type("Ctx", (), {"pages": lambda self=None: [page]})(),
                             page=page,
                             current_url="https://demo-webshop.com/",
-                            actions=[{"kind": "link", "text": "Login", "href": "https://demo-webshop.com/login"}],
+                            actions=[{"kind": "link", "text": "Product details", "href": "https://demo-webshop.com/products/details"}],
                             seen=set(),
                             queue=[],
                             base_url="https://demo-webshop.com/",
                         )
 
         self.assertEqual(page.url, "https://demo-webshop.com/")
+        self.assertTrue(getattr(page, "was_brought_to_front", False))
+
+    def test_browser_action_closes_popup_and_refocuses_scan_page(self) -> None:
+        tester = Phase1Tester("https://demo-webshop.com", browser_mode="browser")
+        page = _FakePlaywrightPage("https://demo-webshop.com/")
+        popup = _FakePlaywrightPage("https://demo-webshop.com/pricing")
+        context = type("Ctx", (), {"pages": lambda self=None: [page, popup]})()
+
+        with patch.object(Phase1Tester, "_click_and_capture_popup", return_value=popup):
+            with patch.object(Phase1Tester, "_page_is_closed", side_effect=lambda candidate: candidate.closed):
+                with patch.object(Phase1Tester, "_scroll_page"):
+                    tester._exercise_visible_actions(
+                        report=TestReport(target_url="https://demo-webshop.com"),
+                        context=context,
+                        page=page,
+                        current_url="https://demo-webshop.com/",
+                        actions=[{"kind": "link", "text": "Pricing", "href": "https://demo-webshop.com/pricing"}],
+                        seen=set(),
+                        queue=[],
+                        base_url="https://demo-webshop.com/",
+                    )
+
+        self.assertTrue(popup.closed)
+        self.assertFalse(page.closed)
+        self.assertTrue(getattr(page, "was_brought_to_front", False))
 
     def test_browser_loop_reopens_closed_page(self) -> None:
         tester = Phase1Tester("https://demo-webshop.com", browser_mode="browser")

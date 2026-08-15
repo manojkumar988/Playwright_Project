@@ -137,6 +137,31 @@ const formatProjectDate = (value: string) => {
   return new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(date)
 }
 
+const normalizeScanUrl = (value: string) => {
+  const trimmed = value.trim()
+  if (!trimmed) return ''
+  if (/^https?:\/\//i.test(trimmed)) return trimmed
+  return `https://${trimmed}`
+}
+
+const extractApiError = async (response: Response) => {
+  const raw = await response.text()
+  if (!raw) return 'Request failed'
+  try {
+    const payload = JSON.parse(raw)
+    if (typeof payload.detail === 'string') return payload.detail
+    if (Array.isArray(payload.detail)) {
+      return payload.detail
+        .map((item: { msg?: string; message?: string }) => item?.msg || item?.message || JSON.stringify(item))
+        .filter(Boolean)
+        .join('; ')
+    }
+  } catch {
+    return raw
+  }
+  return raw
+}
+
 export default function App() {
   const [token, setToken] = useState(() => window.localStorage.getItem(TOKEN_KEY) ?? '')
   const [authMode, setAuthMode] = useState<'login' | 'register' | 'forgot' | 'reset'>('login')
@@ -390,6 +415,15 @@ export default function App() {
   }, [liveLogs])
 
   const runScan = async () => {
+    const targetUrl = normalizeScanUrl(url)
+    if (!targetUrl) {
+      setError('Enter a URL to scan')
+      setLiveOutcome('idle')
+      setLivePhase('Idle')
+      setLiveStartedAt(null)
+      return
+    }
+    setUrl(targetUrl)
     setLoading(true)
     setError('')
     setReport('')
@@ -401,10 +435,10 @@ export default function App() {
       const response = await apiFetch('/scan/live', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, mode, headless }),
+        body: JSON.stringify({ url: targetUrl, mode, headless }),
       })
       if (!response.ok) {
-        throw new Error(await response.text())
+        throw new Error(await extractApiError(response))
       }
       const reader = response.body?.getReader()
       const decoder = new TextDecoder()
@@ -442,8 +476,11 @@ export default function App() {
       }
       await loadData()
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
       setLiveOutcome('error')
-      setError(err instanceof Error ? err.message : String(err))
+      setLivePhase('Interrupted')
+      setLiveLogs((current) => current.length ? current : [`Scan did not start: ${message}`])
+      setError(message)
     } finally {
       setLoading(false)
     }
@@ -700,8 +737,8 @@ export default function App() {
           <header className="dashboard-header">
             <div>
               <p className="eyebrow">Quality overview</p>
-              <h1>Everything looks better when quality is visible.</h1>
-              <p>Monitor site health, launch intelligent scans, and turn every finding into a clear next step.</p>
+              <h1>Build confidence with every scan.</h1>
+              <p>Track site health, catch regressions early, and turn quality signals into clear release decisions.</p>
             </div>
             <button type="button" className="global-logout dashboard-logout" onClick={logout}>Sign out</button>
             <div className="dashboard-header-actions">
@@ -1171,8 +1208,8 @@ export default function App() {
                 <span className="project-avatar" aria-hidden="true">{projectDisplayName.slice(0, 2).toUpperCase()}</span>
                 <div>
                   <p className="eyebrow">Project detail</p>
-                  <h1>{projectDisplayName}</h1>
-                  <a href={selectedProject.base_url} target="_blank" rel="noreferrer">{selectedProject.base_url} <span aria-hidden="true">↗</span></a>
+                  <h1 title={selectedProject.base_url}>{projectDisplayName}</h1>
+                  <a href={selectedProject.base_url} target="_blank" rel="noreferrer" title={selectedProject.base_url}>{selectedProject.base_url} <span aria-hidden="true">↗</span></a>
                 </div>
               </div>
               <button
