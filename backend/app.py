@@ -40,6 +40,14 @@ app = FastAPI(
     title="Autonomous QA Backend",
     version="0.1.0",
     description="FastAPI wrapper around the autonomous website testing workflow.",
+    openapi_tags=[
+        {"name": "health", "description": "Service status and basic backend availability checks."},
+        {"name": "auth", "description": "Email/password account registration, login, verification, and password reset."},
+        {"name": "oauth", "description": "Google OAuth sign-in and callback handling."},
+        {"name": "scan", "description": "Website scan execution and live scan control."},
+        {"name": "projects", "description": "Project records grouped by scanned base URL."},
+        {"name": "scan-results", "description": "Saved scan summaries, details, findings, artifacts, and comparisons."},
+    ],
 )
 
 app.add_middleware(
@@ -452,12 +460,12 @@ def _comparison_response(db: Session, scan: Scan, current_score: int, current_ri
     )
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, tags=["health"], summary="Check backend health")
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-@app.post("/scan", response_model=ScanResponse)
+@app.post("/scan", response_model=ScanResponse, tags=["scan"], summary="Run a non-streaming website scan")
 def scan(request: ScanRequest, user: User = Depends(get_current_user)) -> ScanResponse:
     browser_mode = "browser" if request.mode == "browser-fast" else request.mode
     db = SessionLocal()
@@ -478,7 +486,7 @@ def scan(request: ScanRequest, user: User = Depends(get_current_user)) -> ScanRe
     return ScanResponse(report=format_raw_report(report))
 
 
-@app.post("/scan/live")
+@app.post("/scan/live", tags=["scan"], summary="Run a live streaming website scan")
 def scan_live(request: ScanLiveRequest, user: User = Depends(get_current_user)) -> StreamingResponse:
     _enforce_rate_limit(user, "scan_live")
     validate_public_url(str(request.url))
@@ -578,7 +586,7 @@ def scan_live(request: ScanLiveRequest, user: User = Depends(get_current_user)) 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-@app.post("/scan/live/stop")
+@app.post("/scan/live/stop", tags=["scan"], summary="Stop the active live scan")
 def stop_live_scan(user: User = Depends(get_current_user)) -> dict[str, str]:
     with _live_scan_lock:
         stop_event = _live_scan_state.get("stop_event")
@@ -598,7 +606,7 @@ def stop_live_scan(user: User = Depends(get_current_user)) -> dict[str, str]:
     return {"status": "stopping"}
 
 
-@app.post("/auth/register", response_model=MessageResponse)
+@app.post("/auth/register", response_model=MessageResponse, tags=["auth"], summary="Register with email and send activation email")
 def register(request: RegisterRequest) -> MessageResponse:
     email = request.email.strip().lower()
     if "@" not in email or len(email) > 320:
@@ -641,7 +649,7 @@ def register(request: RegisterRequest) -> MessageResponse:
         db.close()
 
 
-@app.post("/auth/login", response_model=AuthResponse)
+@app.post("/auth/login", response_model=AuthResponse, tags=["auth"], summary="Sign in with email and password")
 def login(request: LoginRequest) -> AuthResponse:
     db = SessionLocal()
     try:
@@ -655,7 +663,7 @@ def login(request: LoginRequest) -> AuthResponse:
         db.close()
 
 
-@app.post("/auth/resend-verification", response_model=MessageResponse)
+@app.post("/auth/resend-verification", response_model=MessageResponse, tags=["auth"], summary="Resend account activation email")
 def resend_verification(request: EmailRequest) -> MessageResponse:
     email = request.email.strip().lower()
     db = SessionLocal()
@@ -676,7 +684,7 @@ def resend_verification(request: EmailRequest) -> MessageResponse:
         db.close()
 
 
-@app.post("/auth/forgot-password", response_model=MessageResponse)
+@app.post("/auth/forgot-password", response_model=MessageResponse, tags=["auth"], summary="Send password reset email")
 def forgot_password(request: PasswordResetRequest) -> MessageResponse:
     email = request.email.strip().lower()
     message = "If an account exists for that email, a password reset link has been sent."
@@ -698,7 +706,7 @@ def forgot_password(request: PasswordResetRequest) -> MessageResponse:
         db.close()
 
 
-@app.post("/auth/reset-password", response_model=MessageResponse)
+@app.post("/auth/reset-password", response_model=MessageResponse, tags=["auth"], summary="Reset password with token")
 def reset_password(request: PasswordResetConfirmRequest) -> MessageResponse:
     email = request.email.strip().lower()
     if len(request.password) < 8:
@@ -718,7 +726,7 @@ def reset_password(request: PasswordResetConfirmRequest) -> MessageResponse:
         db.close()
 
 
-@app.get("/auth/verify-email")
+@app.get("/auth/verify-email", tags=["auth"], summary="Activate account from verification email")
 def verify_email(email: str, token: str):
     frontend_url = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173").rstrip("/")
     db = SessionLocal()
@@ -736,7 +744,7 @@ def verify_email(email: str, token: str):
     return RedirectResponse(f"{frontend_url}/#verified=1")
 
 
-@app.get("/auth/google")
+@app.get("/auth/google", tags=["oauth"], summary="Create Google sign-in URL")
 def google_login() -> dict[str, str]:
     client_id = os.getenv("GOOGLE_CLIENT_ID", "").strip()
     redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/auth/google/callback").strip()
@@ -756,7 +764,7 @@ def google_login() -> dict[str, str]:
     return {"authorization_url": f"https://accounts.google.com/o/oauth2/v2/auth?{query}"}
 
 
-@app.get("/auth/google/callback")
+@app.get("/auth/google/callback", tags=["oauth"], summary="Handle Google OAuth callback")
 def google_callback(code: str, state: str):
     frontend_url = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173").rstrip("/")
     expires_at = _google_states.pop(state, 0)
@@ -806,17 +814,17 @@ def google_callback(code: str, state: str):
     return RedirectResponse(f"{frontend_url}/#oauth_token={token}")
 
 
-@app.get("/auth/me", response_model=AuthResponse)
+@app.get("/auth/me", response_model=AuthResponse, tags=["auth"], summary="Get current authenticated user")
 def auth_me(user: User = Depends(get_current_user)) -> AuthResponse:
     return AuthResponse(access_token="", user_id=user.id, email=user.email)
 
 
-@app.get("/")
+@app.get("/", tags=["health"], summary="Backend running message")
 def root() -> dict[str, str]:
     return {"message": "Autonomous QA backend is running"}
 
 
-@app.get("/projects", response_model=list[ProjectResponse])
+@app.get("/projects", response_model=list[ProjectResponse], tags=["projects"], summary="List projects")
 def list_projects(user: User = Depends(get_current_user)) -> list[ProjectResponse]:
     db = SessionLocal()
     try:
@@ -826,7 +834,7 @@ def list_projects(user: User = Depends(get_current_user)) -> list[ProjectRespons
         db.close()
 
 
-@app.get("/scans", response_model=list[ScanSummaryResponse])
+@app.get("/scans", response_model=list[ScanSummaryResponse], tags=["scan-results"], summary="List scan summaries")
 def list_scans(user: User = Depends(get_current_user)) -> list[ScanSummaryResponse]:
     db = SessionLocal()
     try:
@@ -836,7 +844,7 @@ def list_scans(user: User = Depends(get_current_user)) -> list[ScanSummaryRespon
         db.close()
 
 
-@app.get("/scans/{scan_id}", response_model=ScanDetailResponse)
+@app.get("/scans/{scan_id}", response_model=ScanDetailResponse, tags=["scan-results"], summary="Get scan detail")
 def get_scan(scan_id: int, user: User = Depends(get_current_user)) -> ScanDetailResponse:
     db = SessionLocal()
     try:
@@ -859,7 +867,7 @@ def get_scan(scan_id: int, user: User = Depends(get_current_user)) -> ScanDetail
         db.close()
 
 
-@app.get("/projects/{project_id}/scans", response_model=list[ScanSummaryResponse])
+@app.get("/projects/{project_id}/scans", response_model=list[ScanSummaryResponse], tags=["projects", "scan-results"], summary="List scans for a project")
 def list_project_scans(project_id: int, user: User = Depends(get_current_user)) -> list[ScanSummaryResponse]:
     db = SessionLocal()
     try:
