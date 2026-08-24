@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import threading
 import queue
@@ -221,7 +221,17 @@ class ScanDetailResponse(ScanSummaryResponse):
 
 
 def _iso(value) -> str | None:
-    return value.isoformat() if value is not None else None
+    """Serialize database timestamps as explicit UTC ISO-8601 values.
+
+    SQLAlchemy's legacy DateTime columns contain naive UTC datetimes. Without
+    an offset, browsers interpret those strings as local time and display a
+    shifted hour. Mark naive values as UTC; preserve offsets when present.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def _parse_raw_report(raw_report: str | None) -> dict[str, object]:

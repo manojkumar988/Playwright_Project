@@ -38,7 +38,7 @@ MAX_DEEP_LINKS_PER_TOP_SECTION = 1
 MIN_QUEUED_LINKS_TO_SKIP_ACTIONS = 999
 SLOW_PAGE_THRESHOLD_SECONDS = 3.0
 POST_NAVIGATION_PAUSE_MS = 150
-POPUP_DISMISS_TRIES = 2
+POPUP_DISMISS_TRIES = 4
 ACTION_TIMEOUT_MS = 1500
 POPUP_WAIT_TIMEOUT_MS = 700
 POPUP_DISMISS_SELECTORS = [
@@ -53,6 +53,10 @@ POPUP_DISMISS_SELECTORS = [
     'button:has-text("Dismiss")',
     'button:has-text("No thanks")',
     'button:has-text("Not now")',
+    'button:has-text("Continue shopping")',
+    'button:has-text("Continue")',
+    '[aria-label*="close" i]',
+    '[aria-label*="dismiss" i]',
     'button:has-text("Maybe later")',
     'button:has-text("Skip")',
     'button:has-text("Reject")',
@@ -397,6 +401,8 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
         clicked_action_keys: Set[str] = set()
         tested_form_keys: Set[str] = set()
         queue: list[tuple[str, str | None]] = [(base_url, None)]
+        video_dir = Path(__file__).resolve().parents[2] / "qa-artifacts" / "videos"
+        self._crawl_video_files_before = set(video_dir.glob("*.webm"))
         context = self._open_browser_context(browser)
         self._set_runtime(browser=browser, context=context, page=None)
         console_errors: list[str] = []
@@ -437,6 +443,14 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                         response = page.goto(normalized, wait_until="domcontentloaded")
                     try:
                         page.wait_for_timeout(POST_NAVIGATION_PAUSE_MS)
+                        if not self.fast_browser:
+                            wait_state = getattr(page, "wait_for_load_state", None)
+                            if callable(wait_state):
+                                try:
+                                    wait_state("networkidle", timeout=1200)
+                                except Exception:
+                                    pass
+                            page.wait_for_timeout(500)
                     except Exception:
                         pass
                     if self._is_http_url(page.url) and not self._is_public_http_url(page.url):
@@ -481,11 +495,40 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                         )
                     if not self.fast_browser:
                         self._exercise_forms(report, page, normalized, queue, seen, base_url, clicked_seen, tested_form_keys)
-                    action_links = [] if self.fast_browser or popup_blocking else self._browser_action_links(page, base_url, normalized, clicked_seen, clicked_action_keys)
+
+                    # Keep the page action inventory even when an overlay
+                    # persists; recover per action instead of dropping the page.
+                    action_links = [] if self.fast_browser else self._browser_action_links(page, base_url, normalized, clicked_seen, clicked_action_keys)
+                    if not action_links and not self.fast_browser:
+                        # SPA sites may insert navigation after the first
+                        # meaningful paint. Give the DOM one bounded retry.
+                        try:
+                            page.wait_for_timeout(1000)
+                            self._dismiss_interruptions(page)
+                            action_links = self._browser_action_links(page, base_url, normalized, clicked_seen, clicked_action_keys)
+                            links = self._browser_links(page, normalized, base_url)
+                            nav_links = self._browser_nav_links(page, normalized, base_url)
+                            dom_links = self._browser_dom_links(page, normalized, base_url)
+                        except Exception:
+                            self._raise_if_stopped()
                     if action_links:
                         self._log(f"[browser] Candidate actions ({len(action_links)}): {self._format_actions(action_links)}")
                     else:
                         self._log("[browser] Candidate actions (0): (none)")
+                        body_preview = " ".join(text.split())[:240]
+                        self._log(
+                            f"[browser] No interactive actions after readiness retry: "
+                            f"final_url={page.url}, title={title or '(none)'}, "
+                            f"body={body_preview or '(empty)'}"
+                        )
+                        report.findings.append(
+                            Finding(
+                                category="blocked_or_unrendered_page",
+                                message="Page returned successfully but exposed no interactive actions after rendering retry",
+                                url=normalized,
+                                evidence=[self._capture_browser_evidence(page, normalized, note="zero actions after readiness retry")],
+                            )
+                        )
                     action_hrefs = [str(action.get("href") or "") for action in action_links if action.get("href")]
                     inserted_links = self._insert_next_links(
                         queue,
@@ -523,13 +566,9 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                     )
                     continue
                 finally:
-                    video_path = self._capture_recording_path(page)
-                    if video_path and video_path not in report.recordings:
-                        report.recordings.append(video_path)
-                        self._log(f"[browser] Saved testing video: {video_path}")
+                    pass
 
-                if action_links:
-                    self._exercise_visible_actions(report, context, page, normalized, action_links, seen, queue, base_url, clicked_seen, clicked_action_keys)
+                self._exercise_visible_actions(report, context, page, normalized, action_links, seen, queue, base_url, clicked_seen, clicked_action_keys)
         finally:
             try:
                 page.close()
@@ -539,6 +578,17 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                 context.close()
             except Exception:
                 pass
+            video_path = self._capture_recording_path(page)
+            if video_path:
+                report.recordings[:] = [video_path]
+                before = getattr(self, "_crawl_video_files_before", set())
+                for candidate in Path(video_path).parent.glob("*.webm"):
+                    if candidate not in before and str(candidate) != str(video_path):
+                        try:
+                            candidate.unlink()
+                        except OSError:
+                            pass
+                self._log(f"[browser] Saved complete crawl video: {video_path}")
 
     def _open_browser_context(self, browser: Browser) -> BrowserContext:
         # Keep recordings in an ignored repo-local folder for easy attachment.
@@ -745,7 +795,7 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                 after_url = self._strip_fragment(page.url)
                 if after_url != before_url and self._is_http_url(after_url) and urlparse(after_url).netloc == urlparse(base_url).netloc:
                     self._log(f"[browser] Form resolved to: {self._link_label(after_url)}")
-                    if after_url not in clicked_seen:
+                    if self._duplicate_key(after_url) not in {self._duplicate_key(url) for url in clicked_seen}:
                         clicked_seen.add(after_url)
                         report.clicked_urls.append(after_url)
                     if self._is_candidate_page_url(after_url, base_url):
@@ -779,15 +829,22 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
         skipped_low_value = 0
         skipped_unresolved = 0
         click_failures = 0
+        active_area: str | None = None
         seen_keys = {self._duplicate_key(url) for url in seen}
+        # Visited pages and click coverage are tracked independently.
 
-        for action in actions:
+        for action_index, action in enumerate(actions):
             self._raise_if_stopped()
-            if clicked >= MAX_ACTIONS_PER_PAGE:
-                break
+            area = self._action_area_label(action)
+            if area != active_area:
+                if active_area is not None:
+                    self._log(f"[browser] Completed container: {active_area}")
+                active_area = area
+                self._log(f"[browser] Starting container: {active_area}")
             href = action.get("href")
             text = str(action.get("text") or "").strip()
-            if not text or len(text) > 80 or self._is_low_value_action_text(text):
+            legal_footer = area == "footer" and bool(set(self._normalized_action_text(text).split()) & LEGAL_FOOTER_LINK_TERMS)
+            if not text or len(text) > 80 or (self._is_low_value_action_text(text) and not legal_footer):
                 skipped_low_value += 1
                 continue
             action_key = self._action_key(action)
@@ -795,35 +852,227 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                 skipped_duplicate += 1
                 continue
             href_key = self._duplicate_key(href) if isinstance(href, str) and self._is_http_url(href) else ""
-            if href_key and href_key in seen_keys:
+            if href_key and href_key in {self._duplicate_key(url) for url in clicked_seen}:
                 skipped_duplicate += 1
                 continue
             critical_action = self._is_critical_action(action)
-            if not critical_action and self._is_risky_action_link(href if isinstance(href, str) else None, text, base_url):
+            if not legal_footer and not critical_action and self._is_risky_action_link(href if isinstance(href, str) else None, text, base_url):
                 skipped_low_value += 1
                 continue
-            if isinstance(href, str) and href and not critical_action and not self._is_candidate_page_url(href, base_url):
+            if not legal_footer and isinstance(href, str) and href and not critical_action and not self._is_candidate_page_url(href, base_url):
                 skipped_low_value += 1
                 continue
             try:
+                # Submenu actions belong to a temporary queue owned by the
+                # trigger that opened them. Reopen that menu and re-resolve the
+                # item before every click because many menus unmount after one
+                # selection.
+                if action.get("submenuItem") and action.get("menuOwnerText"):
+                    owner_text = str(action.get("menuOwnerText") or "").strip()
+                    owner_href = action.get("menuOwnerHref")
+                    owner = self._resolve_action_locator(page, {"kind": "link", "href": owner_href, "text": owner_text}, owner_href, owner_text)
+                    if owner is not None:
+                        owner_eval = getattr(owner, "evaluate", None)
+                        if callable(owner_eval):
+                            owner_eval("""el => {
+                              el.focus?.();
+                              for (const type of ['pointerenter','mouseenter','mouseover','focusin'])
+                                el.dispatchEvent(new MouseEvent(type, {bubbles:true, cancelable:true, view:window}));
+                              el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                            }""")
+                        owner_focus = getattr(owner, "focus", None)
+                        if callable(owner_focus):
+                            owner_focus()
+                        page.wait_for_timeout(200)
+
                 label = self._link_label(href or "", text)
                 self._log(f"[browser] Clicking {self._action_area_label(action)} action: {label}")
                 locator = self._resolve_action_locator(page, action, href, text)
                 if locator is None:
+                    self._dismiss_interruptions(page)
+                    try:
+                        page.wait_for_timeout(250)
+                    except Exception:
+                        self._raise_if_stopped()
+                    locator = self._resolve_action_locator(page, action, href, text)
+                if locator is None:
                     skipped_unresolved += 1
                     continue
+                is_submenu_item = bool(action.get("submenuItem"))
+                menu_opened = False
+                is_menu_trigger = bool(action.get("menuTrigger")) or (
+                    area in {"header", "nav"}
+                    and not is_submenu_item
+                    and int(action.get("top") or 0) < 220
+                )
+                if is_menu_trigger:
+                    # Activate top-level menus with DOM pointer/focus events
+                    # before using a click that may follow an href fallback.
+                    try:
+                        evaluate = getattr(locator, "evaluate", None)
+                        menu_before_keys = set()
+                        page_evaluate = getattr(page, "evaluate", None)
+                        if callable(page_evaluate):
+                            menu_before_keys = set(page_evaluate("""() => [...document.querySelectorAll('a[href],button,[role=link],[role=button]')]
+                              .filter(el => el.getClientRects().length)
+                              .map(el => `${el.tagName}:${el.innerText || el.getAttribute('aria-label') || ''}:${el.href || el.getAttribute('href') || ''}`)"""))
+                        if callable(evaluate):
+                            evaluate("""el => {
+                              el.focus?.();
+                              for (const type of ['pointerenter', 'mouseenter', 'mouseover', 'focusin']) {
+                                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                              }
+                              const click = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
+                              el.dispatchEvent(click);
+                            }""")
+                        hover = getattr(locator, "hover", None)
+                        if callable(hover) and action.get("menuTrigger"):
+                            hover(timeout=ACTION_TIMEOUT_MS)
+                        focus = getattr(locator, "focus", None)
+                        if callable(focus):
+                            focus()
+                        page.wait_for_timeout(200)
+                        refreshed_actions = evaluate("""(el, beforeKeys) => {
+                          const visible = node => !!node && node.getClientRects().length > 0;
+                          const text = node => (node.innerText || node.getAttribute('aria-label') || node.getAttribute('title') || '').trim();
+                          const triggerRect = el.getBoundingClientRect();
+                          const localRoots = [];
+                          let cursor = el;
+                          for (let depth = 0; cursor && depth < 5; depth++, cursor = cursor.parentElement) {
+                            for (const child of [...cursor.children]) if (child !== el && visible(child)) localRoots.push(child);
+                          }
+                          // Only use a menu explicitly owned by this trigger or
+                          // a menu-like node in its own DOM neighborhood. A visible
+                          // menu elsewhere must never be attributed to this action.
+                          const ownedRoots = [];
+                          const controls = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+                          if (controls) for (const id of controls.split(/\s+/)) {
+                            const node = document.getElementById(id);
+                            if (node && visible(node)) ownedRoots.push(node);
+                          }
+                          if (el.id) for (const node of document.querySelectorAll(`[aria-labelledby~="${CSS.escape(el.id)}"]`)) {
+                            if (visible(node)) ownedRoots.push(node);
+                          }
+                          const localSemanticRoots = localRoots.filter(node =>
+                            node.matches('[role="menu"], [role="listbox"], [class*="dropdown" i], [class*="submenu" i], [class*="popover" i], ul, [data-menu], [data-dropdown]')
+                          );
+                          const globalRoots = [...document.querySelectorAll(
+                            '[role="menu"], [role="listbox"], [class*="dropdown-menu" i], [class*="submenu" i], [class*="mega-menu" i], [class*="popover" i]'
+                          )].filter(visible);
+                          const roots = [...new Set([...ownedRoots, ...localSemanticRoots, ...globalRoots])];
+                          const root = roots
+                            .filter(node => node !== el && !node.contains(el) && !node.matches('body, main, [role="main"], footer'))
+                            .map(node => {
+                              const rect = node.getBoundingClientRect();
+                              const clickableNodes = [...node.querySelectorAll('a[href], button, [role="link"], [role="button"]')];
+                              const clickableCount = clickableNodes.length;
+                              const newCount = clickableNodes.filter(child => {
+                                const key = `${child.tagName}:${child.innerText || child.getAttribute('aria-label') || ''}:${child.href || child.getAttribute('href') || ''}`;
+                                return !beforeKeys.includes(key);
+                              }).length;
+                              const style = getComputedStyle(node);
+                              const positioned = style.position === 'absolute' || style.position === 'fixed' || Number(style.zIndex || 0) > 0;
+                              const distance = Math.abs(rect.left - triggerRect.left) + Math.abs(rect.top - triggerRect.bottom);
+                              const owned = ownedRoots.includes(node) ? 3000 : 0;
+                              const local = localSemanticRoots.includes(node) ? 1000 : 0;
+                              const changed = newCount ? 5000 + newCount * 100 : 0;
+                              return {node, score: changed + owned + local + (positioned ? 200 : 0) + Math.min(clickableCount, 20) * 10 - distance / 100};
+                            })
+                            .filter(item => item.node.querySelector('a[href], button, [role="link"], [role="button"]'))
+                            .sort((a, b) => b.score - a.score)[0]?.node;
+                          if (!root) return [];
+                          return [...root.querySelectorAll('a[href], button, [role="link"], [role="button"]')]
+                            .filter(node => visible(node) && text(node))
+                            .map(node => {
+                              const raw = node.href || node.getAttribute('href') || node.getAttribute('data-href') || '';
+                              let href = '';
+                              try { href = raw ? new URL(raw, location.href).href : ''; } catch {}
+                              const r = node.getBoundingClientRect();
+                              return {kind: node.tagName.toLowerCase() === 'a' ? 'link' : 'control', text: text(node), href, area: 'nav', menuTrigger: false, submenuItem: true, top: Math.round(r.top + scrollY), left: Math.round(r.left + scrollX)};
+                            });
+                        }""", list(menu_before_keys))
+                        # Snapshot the complete menu in DOM order. Existing
+                        # page-level candidates for the same descendants are
+                        # removed so they cannot compete with this queue.
+                        discovered = []
+                        menu_keys = set()
+                        for refreshed in refreshed_actions:
+                            item = dict(refreshed)
+                            item["menuOwnerText"] = text
+                            item["menuOwnerHref"] = href
+                            key = self._action_key(item)
+                            menu_keys.add(key)
+                            discovered.append(item)
+                        # Some frameworks pre-mount the dropdown in a portal,
+                        # so no newly-visible root is observable. In that case,
+                        # use the ordered action model as a generic fallback: a
+                        # contiguous run of navigation descendants after a menu
+                        # trigger belongs to that trigger until the next
+                        # top-level menu trigger.
+                        if not discovered and area == "nav":
+                            fallback = []
+                            for candidate in actions[action_index + 1:]:
+                                candidate_area = self._action_area_label(candidate)
+                                if candidate_area != "nav":
+                                    break
+                                # Never infer ownership from ordinary top-level
+                                # navigation order. Only candidates independently
+                                # marked as submenu descendants may enter this
+                                # fallback queue.
+                                if not candidate.get("submenuItem"):
+                                    if fallback or candidate.get("menuTrigger"):
+                                        break
+                                    continue
+                                candidate_text = str(candidate.get("text") or "").strip()
+                                if not candidate_text:
+                                    continue
+                                candidate_item = dict(candidate)
+                                candidate_item["menuOwnerText"] = text
+                                candidate_item["menuOwnerHref"] = href
+                                fallback.append(candidate_item)
+                            if fallback:
+                                discovered = fallback
+                        if discovered:
+                            remaining = actions[action_index + 1:]
+                            actions[action_index + 1:] = [
+                                item for item in remaining
+                                if self._action_key(item) not in menu_keys
+                                and not (item.get("submenuItem") and item.get("text") in {x.get("text") for x in discovered})
+                            ]
+                            menu_opened = True
+                            actions[action_index + 1:action_index + 1] = discovered
+                            self._log(
+                                f"[browser] Menu opened; queued {len(discovered)} scoped actions: "
+                                f"{self._format_actions(discovered)}"
+                            )
+                    except Exception as menu_error:
+                        self._log(f"[browser] Menu activation failed; continuing with click: {menu_error}")
                 clicked += 1
+                # Register the intended destination before the browser resolves it;
+                # redirects or SPA fallback URLs must not allow a second click.
+                if href_key:
+                    clicked_seen.add(self._strip_fragment(href))
                 clicked_action_keys.add(action_key)
                 self._dismiss_interruptions(page)
-                self._highlight_action(locator, label)
-                self._log(f"[browser] Highlighting {self._action_area_label(action)} action: {label}")
                 try:
-                    page.wait_for_timeout(350)
+                    page.wait_for_timeout(100)
                 except Exception:
-                    pass
+                    self._raise_if_stopped()
+                highlighted = self._highlight_action(locator, label)
+                if highlighted == "ok":
+                    self._log(f"[browser] Highlighting {self._action_area_label(action)} action: {label}")
+                else:
+                    error_detail = highlighted or "unknown error"
+                    self._log(f"[browser] Could not render highlight for action: {label} ({error_detail})")
+                try:
+                    for _ in range(20):
+                        self._raise_if_stopped()
+                        page.wait_for_timeout(100)
+                except Exception:
+                    self._raise_if_stopped()
                 before_url = page.url
                 before_pages = self._context_pages(context)
-                popup_page = self._click_and_capture_popup(page, locator)
+                popup_page = None if menu_opened else self._click_and_capture_popup(page, locator)
                 self._clear_action_highlight(page)
                 opened_pages = self._context_pages(context)
                 new_pages = [candidate for candidate in opened_pages if candidate not in before_pages]
@@ -846,13 +1095,23 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                 if not self.fast_browser:
                     self._scroll_page(target_page)
                 after_url = self._strip_fragment(target_page.url)
-                if after_url != before_url and self._is_http_url(after_url) and urlparse(after_url).netloc == urlparse(base_url).netloc:
-                    self._log(f"[browser] Click resolved to: {self._link_label(after_url)}")
+                action_text_normalized = self._normalized_action_text(text)
+                ui_only_action = (
+                    str(action.get("kind") or "") != "link"
+                    or area in {"hero", "carousel"} and ("slide" in action_text_normalized or "go to page" in action_text_normalized)
+                    or self._is_non_navigation_ui_action(action)
+                )
+                if after_url != before_url and self._is_http_url(after_url) and urlparse(after_url).netloc == urlparse(base_url).netloc and not ui_only_action:
+                    intended_url = self._strip_fragment(href) if isinstance(href, str) and self._is_http_url(href) else ""
+                    if intended_url and self._duplicate_key(intended_url) != self._duplicate_key(after_url):
+                        self._log(f"[browser] Click outcome differed from intended destination: intended={self._link_label(intended_url)}, actual={self._link_label(after_url)}")
+                    else:
+                        self._log(f"[browser] Click resolved to: {self._link_label(after_url)}")
                     queued_keys = {self._duplicate_key(item[0] if isinstance(item, tuple) else item) for item in queue}
                     inserted = []
                     if self._is_candidate_page_url(after_url, base_url) and self._duplicate_key(after_url) not in seen_keys and self._duplicate_key(after_url) not in queued_keys:
                         inserted = self._insert_next_links(queue, [after_url], current_url, seen)
-                    if after_url not in clicked_seen:
+                    if self._duplicate_key(after_url) not in {self._duplicate_key(url) for url in clicked_seen}:
                         clicked_seen.add(after_url)
                         report.clicked_urls.append(after_url)
                     if inserted:
@@ -864,16 +1123,45 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                     else:
                         self._restore_page_url(page, current_url, quiet=True)
                         self._focus_scan_page(page)
-                    break
                 if target_page is not page:
                     self._log(f"[browser] Click opened a secondary page/modal: {label}")
                     self._close_extra_page(target_page)
                     self._focus_scan_page(page)
                 elif self._strip_fragment(page.url) != self._strip_fragment(current_url):
+                    if ui_only_action:
+                        self._log(f"[browser] UI action changed page state; restoring original page: {label}")
                     self._restore_page_url(page, current_url, quiet=True)
                     self._focus_scan_page(page)
                 else:
                     self._log(f"[browser] Click completed without navigation: {label}")
+
+                # Dynamic menus, tabs, accordions, and dialogs can reveal new
+                # descendants after the click. Re-scan the current page and
+                # insert newly discovered actions immediately after this one,
+                # preserving container/DOM traversal order.
+                if target_page is page and not self._page_is_closed(page) and (
+                    (ui_only_action and area not in {"header", "nav"})
+                    or (is_menu_trigger and not menu_opened)
+                ):
+                    try:
+                        refreshed_actions = self._browser_action_links(
+                            page, base_url, current_url, clicked_seen, clicked_action_keys
+                        )
+                        existing_keys = {self._action_key(item) for item in actions}
+                        discovered = []
+                        for refreshed in refreshed_actions:
+                            key = self._action_key(refreshed)
+                            if key not in existing_keys:
+                                existing_keys.add(key)
+                                discovered.append(refreshed)
+                        if discovered:
+                            actions[action_index + 1:action_index + 1] = discovered
+                            self._log(
+                                f"[browser] Discovered {len(discovered)} new actions after interaction: "
+                                f"{self._format_actions(discovered)}"
+                            )
+                    except Exception as refresh_error:
+                        self._log(f"[browser] Dynamic action refresh failed: {refresh_error}")
             except Exception:
                 if self._should_stop():
                     raise RuntimeError("Scan stopped")
@@ -892,6 +1180,12 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                     pass
                 continue
 
+        if active_area is not None:
+            self._log(f"[browser] Completed container: {active_area}")
+        if not actions:
+            for empty_area in ("header", "nav", "hero", "main", "card", "footer"):
+                self._log(f"[browser] Starting container: {empty_area}")
+                self._log(f"[browser] Completed container: {empty_area}")
         if actions:
             parts = [f"clicked {clicked}"]
             if skipped_duplicate:
@@ -972,14 +1266,15 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                   const areaFor = (el) => {
                     const closest = (selector) => !!el.closest(selector);
                     const rect = el.getBoundingClientRect();
+                    const label = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
                     if (closest('nav, [role="navigation"], [id*="nav-xshop" i], [class*="nav-xshop" i], [class*="main-nav" i], [class*="menu" i]')) return 'nav';
                     if (closest('header, [role="banner"], [id*="header" i], [id="navbar"], [class*="header" i]') || rect.top < 120) return 'header';
-                    if (closest('[class*="hero" i], [id*="hero" i], [class*="banner" i], [id*="banner" i], [class*="carousel" i], [class*="slider" i], [aria-roledescription="carousel"]')) return 'hero';
+                    if (closest('[class*="hero" i], [id*="hero" i], [class*="banner" i], [id*="banner" i], [class*="carousel" i], [class*="slider" i], [aria-roledescription="carousel"]') || /slide|carousel|go\s+to\s+(page|slide)/.test(label)) return 'hero';
                     if (closest('[class*="card" i], [class*="tile" i], article, [class*="grid" i]')) return 'card';
                     if (closest('[class*="carousel" i], [class*="slider" i], [aria-roledescription="carousel"]')) return 'carousel';
-                    if (closest('main, [role="main"]')) return 'main';
-                    if (closest('footer, [role="contentinfo"]')) return 'footer';
-                    return 'other';
+                    if (closest('footer, [role="contentinfo"], [id*="footer" i], [class*="footer" i]')) return 'footer';
+                    if (closest('main, [role="main"], [id*="content" i], [class*="content" i], [id*="body" i], [class*="body" i], section')) return 'main';
+                    return 'main';
                   };
                   const selector = [
                     'a[href]',
@@ -1005,6 +1300,8 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                       text,
                       href,
                       area: areaFor(el),
+                      menuTrigger: !!(el.matches('[aria-haspopup], [aria-expanded], [role="menuitem"], [data-toggle], [data-bs-toggle], [class*="dropdown" i], [class*="menu-trigger" i]') || el.closest('[role="menubar"], [class*="dropdown" i]') || el.closest('li')?.querySelector(':scope > ul, :scope > [role="menu"]') || el.parentElement?.querySelector(':scope > ul, :scope > [role="menu"]')),
+                      submenuItem: !!(el.closest('[role="menu"], [role="menubar"] [role="menu"], ul ul, [class*="dropdown-menu" i], [class*="submenu" i]') || (rect.top + window.scrollY > 220 && el.closest('nav'))),
                       top: Math.max(0, Math.round(rect.top + window.scrollY)),
                       left: Math.max(0, Math.round(rect.left + window.scrollX)),
                     });
@@ -1031,7 +1328,7 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
             if href is not None and href != "" and (not isinstance(href, str) or not self._is_http_url(href)):
                 continue
             normalized = self._strip_fragment(href) if isinstance(href, str) and href else ""
-            if normalized and (normalized == current_url or normalized in clicked_seen):
+            if normalized and (normalized == current_url or self._duplicate_key(normalized) in {self._duplicate_key(url) for url in clicked_seen}):
                 continue
             if normalized and self._is_low_priority_noise_url(normalized):
                 continue
@@ -1081,8 +1378,15 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
                 page.get_by_text(text, exact=False).first,
             ])
         for locator in candidates:
-            if locator is not None:
-                return locator
+            if locator is None:
+                continue
+            try:
+                if locator.count() > 0:
+                    is_visible = getattr(locator, "is_visible", None)
+                    if not callable(is_visible) or is_visible():
+                        return locator
+            except Exception:
+                continue
         return None
 
     @staticmethod
@@ -1267,6 +1571,7 @@ class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
     def _insert_next_links(self, queue: list[tuple[str, str | None]], links: Iterable[str], parent_url: str, seen: Set[str]) -> list[str]:
         queued_keys = {self._duplicate_key(item[0]) for item in queue}
         seen_keys = {self._duplicate_key(url) for url in seen}
+        # Visited pages and click coverage are tracked independently.
         section_counts = self._section_counts([item[0] for item in queue] + list(seen))
         inserted: list[str] = []
         inserted_keys: set[str] = set()
