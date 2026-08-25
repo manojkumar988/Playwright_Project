@@ -86,16 +86,16 @@ PAGE_AREA_PRIORITY = {
     "footer": 8,
     "other": 6,
 }
-SECTION_TEST_ORDER = ("header", "nav", "hero", "card", "carousel", "main", "other", "footer")
+SECTION_TEST_ORDER = ("header", "nav", "hero", "main", "card", "footer")
 SECTION_ACTION_LIMITS = {
-    "header": 3,
-    "nav": 3,
-    "hero": 2,
-    "card": 3,
-    "carousel": 2,
-    "main": 2,
+    "header": 50,
+    "nav": 50,
+    "hero": 50,
+    "card": 50,
+    "carousel": 0,
+    "main": 50,
     "other": 0,
-    "footer": 0,
+    "footer": 50,
 }
 PRIMARY_ACTION_TERMS = {
     "search",

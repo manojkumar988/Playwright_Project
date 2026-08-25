@@ -6,7 +6,7 @@ from .scanner_config import (
     ACTION_TIMEOUT_MS, MAX_ACTIONS_PER_PAGE, HIGH_VALUE_ACTION_TERMS, HIGH_VALUE_PATH_PARTS,
     LOW_VALUE_ACTION_TERMS, NON_NAV_UI_TERMS, PAGE_AREA_PRIORITY,
     PRIMARY_ACTION_TERMS, PRODUCT_METADATA_LABELS, RETRY_ACTION_TERMS,
-    REVIEW_LABEL_TERMS, SECONDARY_ACTION_TERMS, SECTION_ACTION_LIMITS,
+    REVIEW_LABEL_TERMS, SECONDARY_ACTION_TERMS, LEGAL_FOOTER_LINK_TERMS, SECTION_ACTION_LIMITS,
     SECTION_TEST_ORDER, VARIANT_ACTION_TERMS, WEAK_ACTION_LABELS,
 )
 
@@ -17,7 +17,7 @@ class ActionPlannerMixin:
         return " ".join(text.lower().replace("_", " ").replace("-", " ").split())
 
     @classmethod
-    def _is_critical_action(cls, action: dict) -> bool:
+    def _is_critical_action(cls, action: dict) -> str | None:
         text = cls._normalized_action_text(str(action.get("text") or ""))
         href = str(action.get("href") or "").lower().replace("-", " ").replace("_", " ")
         combined = f"{text} {href}"
@@ -26,7 +26,7 @@ class ActionPlannerMixin:
         return any(term in combined for term in PRIMARY_ACTION_TERMS | {"deals", "bestseller", "bestsellers"})
 
     @classmethod
-    def _is_low_value_action_text(cls, text: str) -> bool:
+    def _is_low_value_action_text(cls, text: str) -> str | None:
         normalized = cls._normalized_action_text(text)
         if normalized.isdigit() or (normalized.startswith("(") and normalized.endswith(")")):
             return True
@@ -58,7 +58,7 @@ class ActionPlannerMixin:
         return normalized in LOW_VALUE_ACTION_TERMS
 
     @classmethod
-    def _is_non_navigation_ui_action(cls, action: dict) -> bool:
+    def _is_non_navigation_ui_action(cls, action: dict) -> str | None:
         text = cls._normalized_action_text(str(action.get("text") or ""))
         area = str(action.get("area") or "")
         href = str(action.get("href") or "")
@@ -75,10 +75,14 @@ class ActionPlannerMixin:
             parsed = urlparse(href)
             path = parsed.path.rstrip("/") or "/"
             return f"href:{path}:{text}"
-        return f"text:{area}:{text}"
+        return f"text:{text}"
 
     @classmethod
-    def _is_excluded_planner_action(cls, action: dict) -> bool:
+    def _is_excluded_planner_action(cls, action: dict) -> str | None:
+        area = str(action.get("area") or "")
+        text_terms = set(cls._normalized_action_text(str(action.get("text") or "")).split())
+        if area == "footer":
+            return False
         text = cls._normalized_action_text(str(action.get("text") or ""))
         href = cls._normalized_action_text(str(action.get("href") or ""))
         combined = f"{text} {href}"
@@ -97,33 +101,24 @@ class ActionPlannerMixin:
         return cls._is_low_value_action_text(text) and not cls._is_critical_action(action)
 
     def _plan_actions(self, actions: list[dict]) -> list[dict]:
-        actions = [action for action in actions if not self._is_excluded_planner_action(action)]
-        ranked = self._rank_actions(actions)
+        """Select useful actions in DOM order, grouped by page container."""
         grouped: dict[str, list[dict]] = {area: [] for area in SECTION_TEST_ORDER}
-        for action in ranked:
+        seen_keys: set[str] = set()
+        for action in actions:
+            if self._is_excluded_planner_action(action):
+                continue
             area = self._action_area_label(action)
+            key = self._action_key(action)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             grouped.setdefault(area, []).append(action)
 
-        has_non_footer_actions = any(self._action_area_label(action) != "footer" for action in ranked)
         planned: list[dict] = []
         for area in SECTION_TEST_ORDER:
-            if area == "footer" and has_non_footer_actions:
-                continue
-            limit = SECTION_ACTION_LIMITS.get(area, 1)
-            if limit <= 0:
-                continue
-            planned.extend(grouped.get(area, [])[:limit])
-        planned_keys = {self._action_key(action) for action in planned}
-        for action in ranked:
-            if len(planned) >= max(MAX_ACTIONS_PER_PAGE * 3, MAX_ACTIONS_PER_PAGE):
-                break
-            if self._action_area_label(action) == "footer" and has_non_footer_actions:
-                continue
-            key = self._action_key(action)
-            if key in planned_keys:
-                continue
-            planned.append(action)
-            planned_keys.add(key)
+            limit = SECTION_ACTION_LIMITS.get(area, 0)
+            if limit > 0:
+                planned.extend(grouped.get(area, [])[:limit])
         return planned
 
     def _rank_actions(self, actions: list[dict]) -> list[dict]:
@@ -166,7 +161,7 @@ class ActionPlannerMixin:
         return area if area in PAGE_AREA_PRIORITY else "other"
 
     @staticmethod
-    def _highlight_action(locator, label: str) -> None:
+    def _highlight_action(locator, label: str) -> str | None:
         try:
             locator.scroll_into_view_if_needed(timeout=ACTION_TIMEOUT_MS)
             locator.evaluate(
@@ -181,6 +176,7 @@ class ActionPlannerMixin:
                   el.style.setProperty('outline-offset', '4px', 'important');
                   el.style.setProperty('box-shadow', '0 0 0 6px rgba(255, 176, 0, 0.28), 0 0 18px rgba(255, 176, 0, 0.65)', 'important');
                   el.style.setProperty('position', el.style.position || 'relative', 'important');
+                  el.style.setProperty('z-index', '2147483647', 'important');
                   const r = el.getBoundingClientRect();
                   const pad = 10;
                   const x1 = Math.max(0, r.left - pad);
@@ -190,9 +186,9 @@ class ActionPlannerMixin:
                   const overlay = document.createElement('div');
                   overlay.id = 'qa-scanner-focus-overlay';
                   Object.assign(overlay.style, {
-                    position: 'fixed', inset: '0', zIndex: '2147483646', pointerEvents: 'none',
-                    background: 'rgba(8, 15, 30, 0.68)',
-                    clipPath: `polygon(0 0, 100% 0, 100% 100%, 0 100%, 0 0, ${x1}px ${y1}px, ${x1}px ${y2}px, ${x2}px ${y2}px, ${x2}px ${y1}px, ${x1}px ${y1}px)`,
+                    position: 'fixed', left: x1 + 'px', top: y1 + 'px', width: Math.max(1, x2 - x1) + 'px', height: Math.max(1, y2 - y1) + 'px', zIndex: '2147483646', pointerEvents: 'none',
+                    background: 'transparent',
+                    boxShadow: '0 0 0 9999px rgba(8, 15, 30, 0.68)',
                     transition: 'opacity 120ms ease'
                   });
                   document.body.appendChild(overlay);
@@ -212,8 +208,9 @@ class ActionPlannerMixin:
                 }
                 """, label[:120]
             )
-        except Exception:
-            pass
+            return "ok"
+        except Exception as exc:
+            return str(exc)
 
     @staticmethod
     def _clear_action_highlight(page: Page) -> None:
@@ -227,6 +224,7 @@ class ActionPlannerMixin:
                     el.style.removeProperty('outline-offset');
                     el.style.removeProperty('box-shadow');
                     el.style.removeProperty('position');
+                    el.style.removeProperty('z-index');
                     delete el.dataset.qaScannerHighlight;
                   }
                   document.getElementById('qa-scanner-highlight')?.remove();
