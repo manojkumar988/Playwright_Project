@@ -22,3 +22,4 @@ frontend/dist/
 frontend/.vite/
 !.env.example
 !frontend/.env.example
+qa-artifacts/
