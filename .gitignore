@@ -22,6 +22,4 @@ frontend/dist/
 frontend/.vite/
 !.env.example
 !frontend/.env.example
-
-# Local browser test recordings
-qa-artifacts/videos/
+qa-artifacts/
