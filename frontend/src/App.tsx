@@ -487,6 +487,7 @@ export default function App() {
   }
 
   const stopScan = async () => {
+    setLivePhase('Stopping')
     try {
       const response = await apiFetch('/scan/live/stop', {
         method: 'POST',
@@ -494,7 +495,6 @@ export default function App() {
       if (!response.ok) {
         throw new Error(await response.text())
       }
-      setLivePhase('Stopping')
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }

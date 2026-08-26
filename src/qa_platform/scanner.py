@@ -14,6 +14,13 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from .models import Evidence, Finding, PageSummary, TestReport
+from .action_planner import ActionPlannerMixin
+from .report_builder import ReportBuilderMixin
+from .scanner_config import (
+    CONTENT_LINK_TERMS, HIGH_PRIORITY_LINK_TERMS, HIGH_VALUE_PATH_PARTS,
+    LEGAL_FOOTER_LINK_TERMS, LOW_VALUE_LINK_PATH_PARTS, SPECIAL_SERVICE_LINK_TERMS,
+    SUPPORT_LINK_TERMS, UTILITY_LINK_TERMS,
+)
 
 try:
     from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
@@ -24,14 +31,14 @@ except Exception:  # pragma: no cover - optional dependency
 
 MAX_PAGES = 30
 BROWSER_MAX_PAGES = 15
-MAX_ACTIONS_PER_PAGE = 2
-MAX_NEW_LINKS_PER_PAGE = 5
+MAX_ACTIONS_PER_PAGE = 6
+MAX_NEW_LINKS_PER_PAGE = 8
 MAX_LINKS_PER_TOP_SECTION = 2
 MAX_DEEP_LINKS_PER_TOP_SECTION = 1
-MIN_QUEUED_LINKS_TO_SKIP_ACTIONS = 3
+MIN_QUEUED_LINKS_TO_SKIP_ACTIONS = 999
 SLOW_PAGE_THRESHOLD_SECONDS = 3.0
 POST_NAVIGATION_PAUSE_MS = 150
-POPUP_DISMISS_TRIES = 2
+POPUP_DISMISS_TRIES = 4
 ACTION_TIMEOUT_MS = 1500
 POPUP_WAIT_TIMEOUT_MS = 700
 POPUP_DISMISS_SELECTORS = [
@@ -46,6 +53,10 @@ POPUP_DISMISS_SELECTORS = [
     'button:has-text("Dismiss")',
     'button:has-text("No thanks")',
     'button:has-text("Not now")',
+    'button:has-text("Continue shopping")',
+    'button:has-text("Continue")',
+    '[aria-label*="close" i]',
+    '[aria-label*="dismiss" i]',
     'button:has-text("Maybe later")',
     'button:has-text("Skip")',
     'button:has-text("Reject")',
@@ -60,6 +71,13 @@ POPUP_DISMISS_SELECTORS = [
     '[id*="onetrust-close" i]',
     '[id*="onetrust-reject" i]',
     '[id*="onetrust-accept" i]',
+    '[role="dialog"] button[aria-label*="close" i]',
+    '[aria-modal="true"] button[aria-label*="close" i]',
+    'dialog button[aria-label*="close" i]',
+    '[class*="modal" i] button[aria-label*="close" i]',
+    '[class*="modal" i] button:has-text("Close")',
+    '[role="dialog"] button:has-text("Not now")',
+    '[role="dialog"] button:has-text("No thanks")',
 ]
 IGNORED_NETWORK_HOSTS = {
     "www.google-analytics.com",
@@ -140,26 +158,6 @@ AUTH_HOST_PARTS = {
     "identity",
 }
 LOW_VALUE_QUERY_KEYS = {"hl", "lang", "locale", "theme"}
-HIGH_VALUE_PATH_PARTS = {
-    "about",
-    "pricing",
-    "product",
-    "products",
-    "service",
-    "services",
-    "docs",
-    "documentation",
-    "contact",
-    "signup",
-    "register",
-    "cart",
-    "checkout",
-    "support",
-    "blog",
-    "careers",
-    "features",
-    "solutions",
-}
 IGNORED_CRAWL_EXTENSIONS = {
     ".css",
     ".js",
@@ -226,7 +224,7 @@ class _PageResult:
 
 
 @dataclass
-class Phase1Tester:
+class Phase1Tester(ReportBuilderMixin, ActionPlannerMixin):
     target_url: str
     timeout_seconds: float = 30.0
     browser_mode: str = "auto"
@@ -247,6 +245,22 @@ class Phase1Tester:
     def _set_runtime(self, *, browser=None, context=None, page=None) -> None:
         if self.runtime_hook is not None:
             self.runtime_hook(browser=browser, context=context, page=page)
+
+    @staticmethod
+    def _has_blocking_popup(page: Page) -> bool:
+        selectors = [
+            '[role="dialog"]', '[aria-modal="true"]', 'dialog[open]',
+            '[class*="modal" i]', '[class*="overlay" i]', '[class*="popup" i]',
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                for index in range(min(locator.count(), 5)):
+                    if locator.nth(index).is_visible():
+                        return True
+            except Exception:
+                continue
+        return False
 
     def _dismiss_interruptions(self, page: Page) -> bool:
         dismissed = False
@@ -291,7 +305,18 @@ class Phase1Tester:
                 if dismissed_this_round:
                     break
             if not dismissed_this_round:
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(150)
+                    if not self._has_blocking_popup(page):
+                        dismissed = True
+                        self._log("[browser] Dismissed interruption with Escape")
+                        break
+                except Exception:
+                    self._raise_if_stopped()
                 break
+        if self._has_blocking_popup(page):
+            self._log("[browser] Blocking popup remains after close attempts")
         return dismissed
 
     def run(self) -> TestReport:
@@ -373,7 +398,11 @@ class Phase1Tester:
         seen: Set[str] = set()
         seen_roots: dict[str, str] = {}
         clicked_seen: Set[str] = set()
+        clicked_action_keys: Set[str] = set()
+        tested_form_keys: Set[str] = set()
         queue: list[tuple[str, str | None]] = [(base_url, None)]
+        video_dir = Path(__file__).resolve().parents[2] / "qa-artifacts" / "videos"
+        self._crawl_video_files_before = set(video_dir.glob("*.webm"))
         context = self._open_browser_context(browser)
         self._set_runtime(browser=browser, context=context, page=None)
         console_errors: list[str] = []
@@ -414,11 +443,22 @@ class Phase1Tester:
                         response = page.goto(normalized, wait_until="domcontentloaded")
                     try:
                         page.wait_for_timeout(POST_NAVIGATION_PAUSE_MS)
+                        if not self.fast_browser:
+                            wait_state = getattr(page, "wait_for_load_state", None)
+                            if callable(wait_state):
+                                try:
+                                    wait_state("networkidle", timeout=1200)
+                                except Exception:
+                                    pass
+                            page.wait_for_timeout(500)
                     except Exception:
                         pass
                     if self._is_http_url(page.url) and not self._is_public_http_url(page.url):
                         raise RuntimeError("Blocked redirect to a private or internal network target")
                     self._dismiss_interruptions(page)
+                    popup_blocking = self._has_blocking_popup(page)
+                    if popup_blocking:
+                        self._log("[browser] Popup still blocks page actions; skipping clicks on this page")
                     if not self.fast_browser:
                         self._log(f"[browser] Scrolling page: {normalized}")
                         self._scroll_page(page)
@@ -453,27 +493,55 @@ class Phase1Tester:
                                 evidence=[self._capture_browser_evidence(page, normalized, note=error)],
                             )
                         )
-                    inserted_links = self._insert_next_links(
-                        queue,
-                        [link for link in dom_links + nav_links + links if self._is_candidate_page_url(link, base_url)],
-                        normalized,
-                        seen,
-                    )
-                    if dom_links or nav_links or links:
-                        if inserted_links:
-                            self._log(f"[browser] Added {len(inserted_links)} current-page links to run next: {self._format_queue([(link, normalized) for link in inserted_links])}")
-                        else:
-                            self._log("[browser] No new current-page links to add")
-                        self._log(f"[browser] Queue now ({len(queue)}): {self._format_queue(queue)}")
-                    action_links = [] if self.fast_browser else self._browser_action_links(page, base_url, normalized, clicked_seen)
+                    if not self.fast_browser:
+                        self._exercise_forms(report, page, normalized, queue, seen, base_url, clicked_seen, tested_form_keys)
+
+                    # Keep the page action inventory even when an overlay
+                    # persists; recover per action instead of dropping the page.
+                    action_links = [] if self.fast_browser else self._browser_action_links(page, base_url, normalized, clicked_seen, clicked_action_keys)
+                    if not action_links and not self.fast_browser:
+                        # SPA sites may insert navigation after the first
+                        # meaningful paint. Give the DOM one bounded retry.
+                        try:
+                            page.wait_for_timeout(1000)
+                            self._dismiss_interruptions(page)
+                            action_links = self._browser_action_links(page, base_url, normalized, clicked_seen, clicked_action_keys)
+                            links = self._browser_links(page, normalized, base_url)
+                            nav_links = self._browser_nav_links(page, normalized, base_url)
+                            dom_links = self._browser_dom_links(page, normalized, base_url)
+                        except Exception:
+                            self._raise_if_stopped()
                     if action_links:
                         self._log(f"[browser] Candidate actions ({len(action_links)}): {self._format_actions(action_links)}")
                     else:
                         self._log("[browser] Candidate actions (0): (none)")
-                    skip_actions = len(inserted_links) >= MIN_QUEUED_LINKS_TO_SKIP_ACTIONS
-                    if skip_actions:
-                        self._log(f"[browser] Added {len(inserted_links)} useful links; skipping extra action clicks on this page")
-                        action_links = []
+                        body_preview = " ".join(text.split())[:240]
+                        self._log(
+                            f"[browser] No interactive actions after readiness retry: "
+                            f"final_url={page.url}, title={title or '(none)'}, "
+                            f"body={body_preview or '(empty)'}"
+                        )
+                        report.findings.append(
+                            Finding(
+                                category="blocked_or_unrendered_page",
+                                message="Page returned successfully but exposed no interactive actions after rendering retry",
+                                url=normalized,
+                                evidence=[self._capture_browser_evidence(page, normalized, note="zero actions after readiness retry")],
+                            )
+                        )
+                    action_hrefs = [str(action.get("href") or "") for action in action_links if action.get("href")]
+                    inserted_links = self._insert_next_links(
+                        queue,
+                        [link for link in action_hrefs + dom_links + nav_links + links if self._is_candidate_page_url(link, base_url)],
+                        normalized,
+                        seen,
+                    )
+                    if dom_links or nav_links or links or action_hrefs:
+                        if inserted_links:
+                            self._log(f"[browser] Added {len(inserted_links)} priority links to run next: {self._format_queue([(link, normalized) for link in inserted_links])}")
+                        else:
+                            self._log("[browser] No new current-page links to add")
+                        self._log(f"[browser] Queue now ({len(queue)}): {self._format_queue(queue)}")
                     if response and response.status >= 400:
                         self._capture_error_screenshot(page, normalized, f"http-{response.status}")
                 except Exception as exc:
@@ -498,12 +566,9 @@ class Phase1Tester:
                     )
                     continue
                 finally:
-                    video_path = self._capture_recording_path(page)
-                    if video_path and video_path not in report.recordings:
-                        report.recordings.append(video_path)
+                    pass
 
-                if action_links:
-                    self._exercise_visible_actions(report, context, page, normalized, action_links, seen, queue, base_url, clicked_seen)
+                self._exercise_visible_actions(report, context, page, normalized, action_links, seen, queue, base_url, clicked_seen, clicked_action_keys)
         finally:
             try:
                 page.close()
@@ -513,17 +578,33 @@ class Phase1Tester:
                 context.close()
             except Exception:
                 pass
+            video_path = self._capture_recording_path(page)
+            if video_path:
+                report.recordings[:] = [video_path]
+                before = getattr(self, "_crawl_video_files_before", set())
+                for candidate in Path(video_path).parent.glob("*.webm"):
+                    if candidate not in before and str(candidate) != str(video_path):
+                        try:
+                            candidate.unlink()
+                        except OSError:
+                            pass
+                self._log(f"[browser] Saved complete crawl video: {video_path}")
 
     def _open_browser_context(self, browser: Browser) -> BrowserContext:
+        # Keep recordings in an ignored repo-local folder for easy attachment.
+        video_dir = Path(__file__).resolve().parents[2] / "qa-artifacts" / "videos"
+        video_dir.mkdir(parents=True, exist_ok=True)
+        options = {
+            "ignore_https_errors": True,
+            "record_video_dir": video_dir,
+            "record_video_size": {"width": 1280, "height": 720},
+        }
         if self.headless:
-            return browser.new_context(
-                ignore_https_errors=True,
-                viewport={"width": 1280, "height": 720},
-            )
-        return browser.new_context(
-            ignore_https_errors=True,
-            no_viewport=True,
-        )
+            options["viewport"] = {"width": 1280, "height": 720}
+        else:
+            options["no_viewport"] = True
+        self._log(f"[browser] Recording video to: {video_dir}")
+        return browser.new_context(**options)
 
     def _recover_scan_page(
         self,
@@ -659,48 +740,340 @@ class Phase1Tester:
                 links.append(normalized)
         return links
 
-    def _exercise_visible_actions(self, report: TestReport, context: BrowserContext, page: Page, current_url: str, actions, seen: Set[str], queue, base_url: str, clicked_seen: Set[str] | None = None) -> None:
+    def _exercise_forms(self, report: TestReport, page: Page, current_url: str, queue, seen: Set[str], base_url: str, clicked_seen: Set[str], tested_form_keys: Set[str]) -> None:
+        try:
+            forms = page.evaluate(
+                """
+                () => {
+                  const visible = (el) => !!(el && el.getClientRects().length > 0);
+                  const inputs = [...document.querySelectorAll('input:not([type]), input[type="search"], input[type="text"]')];
+                  const useful = [];
+                  for (const input of inputs) {
+                    if (!visible(input) || input.disabled || input.readOnly) continue;
+                    const name = `${input.name || ''} ${input.id || ''} ${input.placeholder || ''} ${input.getAttribute('aria-label') || ''}`.toLowerCase();
+                    const form = input.closest('form');
+                    const rect = input.getBoundingClientRect();
+                    const isSearch = input.type === 'search' || /search|query|keyword|find|q\b|k\b/.test(name);
+                    if (!isSearch && rect.top > 220) continue;
+                    useful.push({
+                      name,
+                      placeholder: input.placeholder || input.getAttribute('aria-label') || input.name || 'input',
+                      top: Math.max(0, Math.round(rect.top + window.scrollY)),
+                      selectorHint: input.id ? `#${CSS.escape(input.id)}` : input.name ? `input[name="${CSS.escape(input.name)}"]` : '',
+                      hasForm: !!form,
+                      formKey: isSearch ? 'global-search' : `${input.name || input.id || input.placeholder || 'input'}:${Math.round(rect.top)}`,
+                    });
+                  }
+                  return useful.slice(0, 2);
+                }
+                """
+            )
+        except Exception:
+            forms = []
+        if not forms:
+            return
+        for form in forms[:1]:
+            self._raise_if_stopped()
+            form_key = str(form.get("formKey") or "form") if isinstance(form, dict) else "form"
+            if form_key in tested_form_keys:
+                continue
+            selector = str(form.get("selectorHint") or "") if isinstance(form, dict) else ""
+            placeholder = str(form.get("placeholder") or "search") if isinstance(form, dict) else "search"
+            try:
+                locator = page.locator(selector).first if selector else page.locator('input[type="search"], input[name="q"], input[name="k"], input[placeholder*="search" i], input[aria-label*="search" i]').first
+                if locator.count() == 0 or not locator.is_visible():
+                    continue
+                self._log(f"[browser] Testing form input: {placeholder}")
+                tested_form_keys.add(form_key)
+                before_url = self._strip_fragment(page.url)
+                locator.fill("test", timeout=ACTION_TIMEOUT_MS)
+                locator.press("Enter", timeout=ACTION_TIMEOUT_MS)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=min(self.timeout_seconds * 1000, 2500))
+                except Exception:
+                    pass
+                after_url = self._strip_fragment(page.url)
+                if after_url != before_url and self._is_http_url(after_url) and urlparse(after_url).netloc == urlparse(base_url).netloc:
+                    self._log(f"[browser] Form resolved to: {self._link_label(after_url)}")
+                    if self._duplicate_key(after_url) not in {self._duplicate_key(url) for url in clicked_seen}:
+                        clicked_seen.add(after_url)
+                        report.clicked_urls.append(after_url)
+                    if self._is_candidate_page_url(after_url, base_url):
+                        self._insert_next_links(queue, [after_url], current_url, seen)
+                    self._restore_page_url(page, current_url, quiet=True)
+                else:
+                    self._restore_page_url(page, current_url, quiet=True)
+            except Exception as exc:
+                if self._should_stop():
+                    raise RuntimeError("Scan stopped")
+                report.findings.append(
+                    Finding(
+                        category="navigation_failure",
+                        message=f"Form input test failed: {exc}",
+                        url=current_url,
+                        evidence=[self.evidence_for_url(current_url, note=str(exc))],
+                    )
+                )
+                try:
+                    self._restore_page_url(page, current_url, quiet=True)
+                except Exception:
+                    pass
+
+    def _exercise_visible_actions(self, report: TestReport, context: BrowserContext, page: Page, current_url: str, actions, seen: Set[str], queue, base_url: str, clicked_seen: Set[str] | None = None, clicked_action_keys: Set[str] | None = None) -> None:
         if clicked_seen is None:
             clicked_seen = set()
+        if clicked_action_keys is None:
+            clicked_action_keys = set()
         clicked = 0
         skipped_duplicate = 0
         skipped_low_value = 0
         skipped_unresolved = 0
         click_failures = 0
+        active_area: str | None = None
         seen_keys = {self._duplicate_key(url) for url in seen}
+        # Visited pages and click coverage are tracked independently.
 
-        for action in actions:
+        for action_index, action in enumerate(actions):
             self._raise_if_stopped()
-            if clicked >= MAX_ACTIONS_PER_PAGE:
-                break
+            area = self._action_area_label(action)
+            if area != active_area:
+                if active_area is not None:
+                    self._log(f"[browser] Completed container: {active_area}")
+                active_area = area
+                self._log(f"[browser] Starting container: {active_area}")
             href = action.get("href")
             text = str(action.get("text") or "").strip()
-            if not text or len(text) > 80:
+            legal_footer = area == "footer" and bool(set(self._normalized_action_text(text).split()) & LEGAL_FOOTER_LINK_TERMS)
+            if not text or len(text) > 80 or (self._is_low_value_action_text(text) and not legal_footer):
                 skipped_low_value += 1
                 continue
-            queued_keys = {self._duplicate_key(item[0] if isinstance(item, tuple) else item) for item in queue}
-            href_key = self._duplicate_key(href) if isinstance(href, str) and self._is_http_url(href) else ""
-            if href_key and (href_key in queued_keys or href_key in seen_keys):
+            action_key = self._action_key(action)
+            if action_key in clicked_action_keys:
                 skipped_duplicate += 1
                 continue
-            if self._is_risky_action_link(href if isinstance(href, str) else None, text, base_url):
+            href_key = self._duplicate_key(href) if isinstance(href, str) and self._is_http_url(href) else ""
+            if href_key and href_key in {self._duplicate_key(url) for url in clicked_seen}:
+                skipped_duplicate += 1
+                continue
+            critical_action = self._is_critical_action(action)
+            if not legal_footer and not critical_action and self._is_risky_action_link(href if isinstance(href, str) else None, text, base_url):
                 skipped_low_value += 1
                 continue
-            if isinstance(href, str) and not self._is_candidate_page_url(href, base_url):
+            if not legal_footer and isinstance(href, str) and href and not critical_action and not self._is_candidate_page_url(href, base_url):
                 skipped_low_value += 1
                 continue
             try:
+                # Submenu actions belong to a temporary queue owned by the
+                # trigger that opened them. Reopen that menu and re-resolve the
+                # item before every click because many menus unmount after one
+                # selection.
+                if action.get("submenuItem") and action.get("menuOwnerText"):
+                    owner_text = str(action.get("menuOwnerText") or "").strip()
+                    owner_href = action.get("menuOwnerHref")
+                    owner = self._resolve_action_locator(page, {"kind": "link", "href": owner_href, "text": owner_text}, owner_href, owner_text)
+                    if owner is not None:
+                        owner_eval = getattr(owner, "evaluate", None)
+                        if callable(owner_eval):
+                            owner_eval("""el => {
+                              el.focus?.();
+                              for (const type of ['pointerenter','mouseenter','mouseover','focusin'])
+                                el.dispatchEvent(new MouseEvent(type, {bubbles:true, cancelable:true, view:window}));
+                              el.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                            }""")
+                        owner_focus = getattr(owner, "focus", None)
+                        if callable(owner_focus):
+                            owner_focus()
+                        page.wait_for_timeout(200)
+
                 label = self._link_label(href or "", text)
-                self._log(f"[browser] Clicking link: {label}")
+                self._log(f"[browser] Clicking {self._action_area_label(action)} action: {label}")
                 locator = self._resolve_action_locator(page, action, href, text)
+                if locator is None:
+                    self._dismiss_interruptions(page)
+                    try:
+                        page.wait_for_timeout(250)
+                    except Exception:
+                        self._raise_if_stopped()
+                    locator = self._resolve_action_locator(page, action, href, text)
                 if locator is None:
                     skipped_unresolved += 1
                     continue
+                is_submenu_item = bool(action.get("submenuItem"))
+                menu_opened = False
+                is_menu_trigger = bool(action.get("menuTrigger")) or (
+                    area in {"header", "nav"}
+                    and not is_submenu_item
+                    and int(action.get("top") or 0) < 220
+                )
+                if is_menu_trigger:
+                    # Activate top-level menus with DOM pointer/focus events
+                    # before using a click that may follow an href fallback.
+                    try:
+                        evaluate = getattr(locator, "evaluate", None)
+                        menu_before_keys = set()
+                        page_evaluate = getattr(page, "evaluate", None)
+                        if callable(page_evaluate):
+                            menu_before_keys = set(page_evaluate("""() => [...document.querySelectorAll('a[href],button,[role=link],[role=button]')]
+                              .filter(el => el.getClientRects().length)
+                              .map(el => `${el.tagName}:${el.innerText || el.getAttribute('aria-label') || ''}:${el.href || el.getAttribute('href') || ''}`)"""))
+                        if callable(evaluate):
+                            evaluate("""el => {
+                              el.focus?.();
+                              for (const type of ['pointerenter', 'mouseenter', 'mouseover', 'focusin']) {
+                                el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+                              }
+                              const click = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
+                              el.dispatchEvent(click);
+                            }""")
+                        hover = getattr(locator, "hover", None)
+                        if callable(hover) and action.get("menuTrigger"):
+                            hover(timeout=ACTION_TIMEOUT_MS)
+                        focus = getattr(locator, "focus", None)
+                        if callable(focus):
+                            focus()
+                        page.wait_for_timeout(200)
+                        refreshed_actions = evaluate("""(el, beforeKeys) => {
+                          const visible = node => !!node && node.getClientRects().length > 0;
+                          const text = node => (node.innerText || node.getAttribute('aria-label') || node.getAttribute('title') || '').trim();
+                          const triggerRect = el.getBoundingClientRect();
+                          const localRoots = [];
+                          let cursor = el;
+                          for (let depth = 0; cursor && depth < 5; depth++, cursor = cursor.parentElement) {
+                            for (const child of [...cursor.children]) if (child !== el && visible(child)) localRoots.push(child);
+                          }
+                          // Only use a menu explicitly owned by this trigger or
+                          // a menu-like node in its own DOM neighborhood. A visible
+                          // menu elsewhere must never be attributed to this action.
+                          const ownedRoots = [];
+                          const controls = el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+                          if (controls) for (const id of controls.split(/\s+/)) {
+                            const node = document.getElementById(id);
+                            if (node && visible(node)) ownedRoots.push(node);
+                          }
+                          if (el.id) for (const node of document.querySelectorAll(`[aria-labelledby~="${CSS.escape(el.id)}"]`)) {
+                            if (visible(node)) ownedRoots.push(node);
+                          }
+                          const localSemanticRoots = localRoots.filter(node =>
+                            node.matches('[role="menu"], [role="listbox"], [class*="dropdown" i], [class*="submenu" i], [class*="popover" i], ul, [data-menu], [data-dropdown]')
+                          );
+                          const globalRoots = [...document.querySelectorAll(
+                            '[role="menu"], [role="listbox"], [class*="dropdown-menu" i], [class*="submenu" i], [class*="mega-menu" i], [class*="popover" i]'
+                          )].filter(visible);
+                          const roots = [...new Set([...ownedRoots, ...localSemanticRoots, ...globalRoots])];
+                          const root = roots
+                            .filter(node => node !== el && !node.contains(el) && !node.matches('body, main, [role="main"], footer'))
+                            .map(node => {
+                              const rect = node.getBoundingClientRect();
+                              const clickableNodes = [...node.querySelectorAll('a[href], button, [role="link"], [role="button"]')];
+                              const clickableCount = clickableNodes.length;
+                              const newCount = clickableNodes.filter(child => {
+                                const key = `${child.tagName}:${child.innerText || child.getAttribute('aria-label') || ''}:${child.href || child.getAttribute('href') || ''}`;
+                                return !beforeKeys.includes(key);
+                              }).length;
+                              const style = getComputedStyle(node);
+                              const positioned = style.position === 'absolute' || style.position === 'fixed' || Number(style.zIndex || 0) > 0;
+                              const distance = Math.abs(rect.left - triggerRect.left) + Math.abs(rect.top - triggerRect.bottom);
+                              const owned = ownedRoots.includes(node) ? 3000 : 0;
+                              const local = localSemanticRoots.includes(node) ? 1000 : 0;
+                              const changed = newCount ? 5000 + newCount * 100 : 0;
+                              return {node, score: changed + owned + local + (positioned ? 200 : 0) + Math.min(clickableCount, 20) * 10 - distance / 100};
+                            })
+                            .filter(item => item.node.querySelector('a[href], button, [role="link"], [role="button"]'))
+                            .sort((a, b) => b.score - a.score)[0]?.node;
+                          if (!root) return [];
+                          return [...root.querySelectorAll('a[href], button, [role="link"], [role="button"]')]
+                            .filter(node => visible(node) && text(node))
+                            .map(node => {
+                              const raw = node.href || node.getAttribute('href') || node.getAttribute('data-href') || '';
+                              let href = '';
+                              try { href = raw ? new URL(raw, location.href).href : ''; } catch {}
+                              const r = node.getBoundingClientRect();
+                              return {kind: node.tagName.toLowerCase() === 'a' ? 'link' : 'control', text: text(node), href, area: 'nav', menuTrigger: false, submenuItem: true, top: Math.round(r.top + scrollY), left: Math.round(r.left + scrollX)};
+                            });
+                        }""", list(menu_before_keys))
+                        # Snapshot the complete menu in DOM order. Existing
+                        # page-level candidates for the same descendants are
+                        # removed so they cannot compete with this queue.
+                        discovered = []
+                        menu_keys = set()
+                        for refreshed in refreshed_actions:
+                            item = dict(refreshed)
+                            item["menuOwnerText"] = text
+                            item["menuOwnerHref"] = href
+                            key = self._action_key(item)
+                            menu_keys.add(key)
+                            discovered.append(item)
+                        # Some frameworks pre-mount the dropdown in a portal,
+                        # so no newly-visible root is observable. In that case,
+                        # use the ordered action model as a generic fallback: a
+                        # contiguous run of navigation descendants after a menu
+                        # trigger belongs to that trigger until the next
+                        # top-level menu trigger.
+                        if not discovered and area == "nav":
+                            fallback = []
+                            for candidate in actions[action_index + 1:]:
+                                candidate_area = self._action_area_label(candidate)
+                                if candidate_area != "nav":
+                                    break
+                                # Never infer ownership from ordinary top-level
+                                # navigation order. Only candidates independently
+                                # marked as submenu descendants may enter this
+                                # fallback queue.
+                                if not candidate.get("submenuItem"):
+                                    if fallback or candidate.get("menuTrigger"):
+                                        break
+                                    continue
+                                candidate_text = str(candidate.get("text") or "").strip()
+                                if not candidate_text:
+                                    continue
+                                candidate_item = dict(candidate)
+                                candidate_item["menuOwnerText"] = text
+                                candidate_item["menuOwnerHref"] = href
+                                fallback.append(candidate_item)
+                            if fallback:
+                                discovered = fallback
+                        if discovered:
+                            remaining = actions[action_index + 1:]
+                            actions[action_index + 1:] = [
+                                item for item in remaining
+                                if self._action_key(item) not in menu_keys
+                                and not (item.get("submenuItem") and item.get("text") in {x.get("text") for x in discovered})
+                            ]
+                            menu_opened = True
+                            actions[action_index + 1:action_index + 1] = discovered
+                            self._log(
+                                f"[browser] Menu opened; queued {len(discovered)} scoped actions: "
+                                f"{self._format_actions(discovered)}"
+                            )
+                    except Exception as menu_error:
+                        self._log(f"[browser] Menu activation failed; continuing with click: {menu_error}")
                 clicked += 1
+                # Register the intended destination before the browser resolves it;
+                # redirects or SPA fallback URLs must not allow a second click.
+                if href_key:
+                    clicked_seen.add(self._strip_fragment(href))
+                clicked_action_keys.add(action_key)
                 self._dismiss_interruptions(page)
+                try:
+                    page.wait_for_timeout(100)
+                except Exception:
+                    self._raise_if_stopped()
+                highlighted = self._highlight_action(locator, label)
+                if highlighted == "ok":
+                    self._log(f"[browser] Highlighting {self._action_area_label(action)} action: {label}")
+                else:
+                    error_detail = highlighted or "unknown error"
+                    self._log(f"[browser] Could not render highlight for action: {label} ({error_detail})")
+                try:
+                    for _ in range(20):
+                        self._raise_if_stopped()
+                        page.wait_for_timeout(100)
+                except Exception:
+                    self._raise_if_stopped()
                 before_url = page.url
                 before_pages = self._context_pages(context)
-                popup_page = self._click_and_capture_popup(page, locator)
+                popup_page = None if menu_opened else self._click_and_capture_popup(page, locator)
+                self._clear_action_highlight(page)
                 opened_pages = self._context_pages(context)
                 new_pages = [candidate for candidate in opened_pages if candidate not in before_pages]
                 target_page = page
@@ -722,13 +1095,23 @@ class Phase1Tester:
                 if not self.fast_browser:
                     self._scroll_page(target_page)
                 after_url = self._strip_fragment(target_page.url)
-                if after_url != before_url and self._is_http_url(after_url) and urlparse(after_url).netloc == urlparse(base_url).netloc:
-                    self._log(f"[browser] Click resolved to: {self._link_label(after_url)}")
+                action_text_normalized = self._normalized_action_text(text)
+                ui_only_action = (
+                    str(action.get("kind") or "") != "link"
+                    or area in {"hero", "carousel"} and ("slide" in action_text_normalized or "go to page" in action_text_normalized)
+                    or self._is_non_navigation_ui_action(action)
+                )
+                if after_url != before_url and self._is_http_url(after_url) and urlparse(after_url).netloc == urlparse(base_url).netloc and not ui_only_action:
+                    intended_url = self._strip_fragment(href) if isinstance(href, str) and self._is_http_url(href) else ""
+                    if intended_url and self._duplicate_key(intended_url) != self._duplicate_key(after_url):
+                        self._log(f"[browser] Click outcome differed from intended destination: intended={self._link_label(intended_url)}, actual={self._link_label(after_url)}")
+                    else:
+                        self._log(f"[browser] Click resolved to: {self._link_label(after_url)}")
                     queued_keys = {self._duplicate_key(item[0] if isinstance(item, tuple) else item) for item in queue}
                     inserted = []
                     if self._is_candidate_page_url(after_url, base_url) and self._duplicate_key(after_url) not in seen_keys and self._duplicate_key(after_url) not in queued_keys:
                         inserted = self._insert_next_links(queue, [after_url], current_url, seen)
-                    if after_url not in clicked_seen:
+                    if self._duplicate_key(after_url) not in {self._duplicate_key(url) for url in clicked_seen}:
                         clicked_seen.add(after_url)
                         report.clicked_urls.append(after_url)
                     if inserted:
@@ -740,16 +1123,51 @@ class Phase1Tester:
                     else:
                         self._restore_page_url(page, current_url, quiet=True)
                         self._focus_scan_page(page)
-                    break
                 if target_page is not page:
+                    self._log(f"[browser] Click opened a secondary page/modal: {label}")
                     self._close_extra_page(target_page)
                     self._focus_scan_page(page)
                 elif self._strip_fragment(page.url) != self._strip_fragment(current_url):
+                    if ui_only_action:
+                        self._log(f"[browser] UI action changed page state; restoring original page: {label}")
                     self._restore_page_url(page, current_url, quiet=True)
                     self._focus_scan_page(page)
+                else:
+                    self._log(f"[browser] Click completed without navigation: {label}")
+
+                # Dynamic menus, tabs, accordions, and dialogs can reveal new
+                # descendants after the click. Re-scan the current page and
+                # insert newly discovered actions immediately after this one,
+                # preserving container/DOM traversal order.
+                if target_page is page and not self._page_is_closed(page) and (
+                    (ui_only_action and area not in {"header", "nav"})
+                    or (is_menu_trigger and not menu_opened)
+                ):
+                    try:
+                        refreshed_actions = self._browser_action_links(
+                            page, base_url, current_url, clicked_seen, clicked_action_keys
+                        )
+                        existing_keys = {self._action_key(item) for item in actions}
+                        discovered = []
+                        for refreshed in refreshed_actions:
+                            key = self._action_key(refreshed)
+                            if key not in existing_keys:
+                                existing_keys.add(key)
+                                discovered.append(refreshed)
+                        if discovered:
+                            actions[action_index + 1:action_index + 1] = discovered
+                            self._log(
+                                f"[browser] Discovered {len(discovered)} new actions after interaction: "
+                                f"{self._format_actions(discovered)}"
+                            )
+                    except Exception as refresh_error:
+                        self._log(f"[browser] Dynamic action refresh failed: {refresh_error}")
             except Exception:
                 if self._should_stop():
                     raise RuntimeError("Scan stopped")
+                if self._is_non_navigation_ui_action(action):
+                    self._log(f"[browser] UI interaction did not navigate: {self._link_label(href or '', text)}")
+                    continue
                 click_failures += 1
                 try:
                     for candidate in self._context_pages(context):
@@ -762,6 +1180,12 @@ class Phase1Tester:
                     pass
                 continue
 
+        if active_area is not None:
+            self._log(f"[browser] Completed container: {active_area}")
+        if not actions:
+            for empty_area in ("header", "nav", "hero", "main", "card", "footer"):
+                self._log(f"[browser] Starting container: {empty_area}")
+                self._log(f"[browser] Completed container: {empty_area}")
         if actions:
             parts = [f"clicked {clicked}"]
             if skipped_duplicate:
@@ -773,6 +1197,15 @@ class Phase1Tester:
             if click_failures:
                 parts.append(f"{click_failures} click attempts did not complete")
             self._log(f"[browser] Action summary: {', '.join(parts)}")
+            if click_failures:
+                report.findings.append(
+                    Finding(
+                        category="navigation_failure",
+                        message=f"{click_failures} visible action click attempt(s) did not complete",
+                        url=current_url,
+                        evidence=[self.evidence_for_url(current_url, note="click attempts did not complete")],
+                    )
+                )
     def _restore_page_url(self, page: Page, current_url: str, quiet: bool = False) -> bool:
         expected_url = self._strip_fragment(current_url)
         self._raise_if_stopped()
@@ -820,29 +1253,57 @@ class Phase1Tester:
             self._log(f"[browser] Page restore failed; visible page is {getattr(page, 'url', 'unknown')}")
         return False
 
-    def _browser_action_links(self, page: Page, base_url: str, current_url: str, clicked_seen: Set[str]) -> list[dict]:
+    def _browser_action_links(self, page: Page, base_url: str, current_url: str, clicked_seen: Set[str], clicked_action_keys: Set[str] | None = None) -> list[dict]:
         try:
             candidates = page.evaluate(
                 """
                 (baseUrl) => {
                   const sameOrigin = (href) => {
-                    try { return new URL(href).origin === new URL(baseUrl).origin; } catch { return false; }
+                    try { return new URL(href, window.location.href).origin === new URL(baseUrl).origin; } catch { return false; }
                   };
                   const visible = (el) => !!(el && el.getClientRects().length > 0);
-                  const candidates = [
-                    ...document.querySelectorAll('a[href]')
-                  ];
+                  const textFor = (el) => (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || el.alt || '').trim();
+                  const areaFor = (el) => {
+                    const closest = (selector) => !!el.closest(selector);
+                    const rect = el.getBoundingClientRect();
+                    const label = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+                    if (closest('nav, [role="navigation"], [id*="nav-xshop" i], [class*="nav-xshop" i], [class*="main-nav" i], [class*="menu" i]')) return 'nav';
+                    if (closest('header, [role="banner"], [id*="header" i], [id="navbar"], [class*="header" i]') || rect.top < 120) return 'header';
+                    if (closest('[class*="hero" i], [id*="hero" i], [class*="banner" i], [id*="banner" i], [class*="carousel" i], [class*="slider" i], [aria-roledescription="carousel"]') || /slide|carousel|go\s+to\s+(page|slide)/.test(label)) return 'hero';
+                    if (closest('[class*="card" i], [class*="tile" i], article, [class*="grid" i]')) return 'card';
+                    if (closest('[class*="carousel" i], [class*="slider" i], [aria-roledescription="carousel"]')) return 'carousel';
+                    if (closest('footer, [role="contentinfo"], [id*="footer" i], [class*="footer" i]')) return 'footer';
+                    if (closest('main, [role="main"], [id*="content" i], [class*="content" i], [id*="body" i], [class*="body" i], section')) return 'main';
+                    return 'main';
+                  };
+                  const selector = [
+                    'a[href]',
+                    'button',
+                    '[role="button"]',
+                    '[role="link"]',
+                    'input[type="submit"]'
+                  ].join(',');
                   const out = [];
-                  for (const el of candidates) {
+                  for (const el of document.querySelectorAll(selector)) {
                     if (!visible(el)) continue;
-                    const href = el.href;
-                    const text = (el.innerText || el.getAttribute('aria-label') || '').trim();
+                    const rawHref = el.href || el.getAttribute('href') || el.getAttribute('data-href') || el.getAttribute('formaction') || '';
+                    let href = '';
+                    if (rawHref) {
+                      try { href = new URL(rawHref, window.location.href).href; } catch {}
+                    }
+                    if (href && !sameOrigin(href)) continue;
+                    const text = textFor(el);
                     if (!text || text.length > 80) continue;
-                    if (!href || !sameOrigin(href)) continue;
+                    const rect = el.getBoundingClientRect();
                     out.push({
-                      kind: 'link',
+                      kind: el.tagName.toLowerCase() === 'a' ? 'link' : 'control',
                       text,
                       href,
+                      area: areaFor(el),
+                      menuTrigger: !!(el.matches('[aria-haspopup], [aria-expanded], [role="menuitem"], [data-toggle], [data-bs-toggle], [class*="dropdown" i], [class*="menu-trigger" i]') || el.closest('[role="menubar"], [class*="dropdown" i]') || el.closest('li')?.querySelector(':scope > ul, :scope > [role="menu"]') || el.parentElement?.querySelector(':scope > ul, :scope > [role="menu"]')),
+                      submenuItem: !!(el.closest('[role="menu"], [role="menubar"] [role="menu"], ul ul, [class*="dropdown-menu" i], [class*="submenu" i]') || (rect.top + window.scrollY > 220 && el.closest('nav'))),
+                      top: Math.max(0, Math.round(rect.top + window.scrollY)),
+                      left: Math.max(0, Math.round(rect.left + window.scrollX)),
                     });
                   }
                   return out;
@@ -854,6 +1315,7 @@ class Phase1Tester:
             candidates = []
 
         links: list[dict] = []
+        seen_action_keys: set[str] = set(clicked_action_keys or set())
         for item in candidates:
             if not isinstance(item, dict):
                 continue
@@ -861,12 +1323,24 @@ class Phase1Tester:
             text = str(item.get("text") or "").strip()
             if not text or len(text) > 80:
                 continue
-            if href is not None and (not isinstance(href, str) or not self._is_http_url(href)):
+            if self._is_excluded_planner_action(item):
                 continue
-            normalized = self._strip_fragment(href) if isinstance(href, str) else ""
-            if normalized and normalized != current_url and normalized not in clicked_seen and normalized not in [str(link.get("href") or "") for link in links]:
-                links.append(item)
-        return links
+            if href is not None and href != "" and (not isinstance(href, str) or not self._is_http_url(href)):
+                continue
+            normalized = self._strip_fragment(href) if isinstance(href, str) and href else ""
+            if normalized and (normalized == current_url or self._duplicate_key(normalized) in {self._duplicate_key(url) for url in clicked_seen}):
+                continue
+            if normalized and self._is_low_priority_noise_url(normalized):
+                continue
+            action_key = self._action_key(item) if not normalized else normalized
+            if action_key in seen_action_keys:
+                continue
+            seen_action_keys.add(action_key)
+            copied = dict(item)
+            if normalized:
+                copied["href"] = normalized
+            links.append(copied)
+        return self._plan_actions(links)
 
         back = getattr(page, "go_back", None)
         if callable(back):
@@ -894,18 +1368,25 @@ class Phase1Tester:
 
     def _resolve_action_locator(self, page: Page, action, href: str | None, text: str):
         candidates = []
-        if action.get("kind") == "link" and href:
-            candidates.extend(
-                [
-                    page.get_by_text(text, exact=False).first,
-                    page.locator(f'a[href^="{self._css_escape(href.split("#", 1)[0])}"]').first,
-                ]
-            )
-        else:
+        if href:
+            candidates.append(page.locator(f'a[href^="{self._css_escape(href.split("#", 1)[0])}"]').first)
+        if action.get("kind") == "link":
             candidates.append(page.get_by_text(text, exact=False).first)
+        else:
+            candidates.extend([
+                page.get_by_role("button", name=text, exact=False).first,
+                page.get_by_text(text, exact=False).first,
+            ])
         for locator in candidates:
-            if locator is not None:
-                return locator
+            if locator is None:
+                continue
+            try:
+                if locator.count() > 0:
+                    is_visible = getattr(locator, "is_visible", None)
+                    if not callable(is_visible) or is_visible():
+                        return locator
+            except Exception:
+                continue
         return None
 
     @staticmethod
@@ -942,7 +1423,7 @@ class Phase1Tester:
         normalized_text = " ".join(text.lower().replace("_", " ").replace("-", " ").split())
         compact_text = normalized_text.replace(" ", "")
         if normalized_text in AUTH_ACTION_TEXT or compact_text in AUTH_ACTION_TEXT:
-            return True
+            return False
         if not href or not self._is_http_url(href):
             return False
         parsed = urlparse(href)
@@ -1090,13 +1571,19 @@ class Phase1Tester:
     def _insert_next_links(self, queue: list[tuple[str, str | None]], links: Iterable[str], parent_url: str, seen: Set[str]) -> list[str]:
         queued_keys = {self._duplicate_key(item[0]) for item in queue}
         seen_keys = {self._duplicate_key(url) for url in seen}
+        # Visited pages and click coverage are tracked independently.
         section_counts = self._section_counts([item[0] for item in queue] + list(seen))
         inserted: list[str] = []
         inserted_keys: set[str] = set()
         remaining_slots = max(0, min(MAX_NEW_LINKS_PER_PAGE, MAX_PAGES - len(seen) - len(queue)))
-        for link in self._rank_links(links, parent_url):
+        ranked_links = self._rank_links(links, parent_url)
+        has_primary_or_normal_links = any(self._link_priority_tier(link) <= 1 for link in ranked_links)
+        for link in ranked_links:
             if len(inserted) >= remaining_slots:
                 break
+            tier = self._link_priority_tier(link)
+            if has_primary_or_normal_links and tier >= 3:
+                continue
             normalized = self._canonicalize_url(link)
             key = self._duplicate_key(normalized)
             if key in seen_keys or key in queued_keys or key in inserted_keys:
@@ -1182,337 +1669,6 @@ class Phase1Tester:
             title=" ".join(parser.title_chunks).strip(),
         )
 
-    def _collect_page_findings(self, report: TestReport, page: _PageResult) -> None:
-        if page.error:
-            category = "broken_link" if page.status and page.status >= 400 else "api_failure"
-            report.findings.append(
-                Finding(
-                    category=category,
-                    message=f"Failed to load page: {page.error}",
-                    url=page.url,
-                    evidence=[self.evidence_for_url(page.url, note=page.error)],
-                )
-            )
-            return
-
-        if page.status and page.status >= 400:
-            report.findings.append(
-                Finding(
-                    category="broken_link",
-                    message=f"Page returned HTTP {page.status}",
-                    url=page.url,
-                    evidence=[self.evidence_for_url(page.url, note=f"HTTP {page.status}")],
-                )
-            )
-        if page.duration_seconds >= SLOW_PAGE_THRESHOLD_SECONDS:
-            report.findings.append(
-                Finding(
-                    category="slow_page",
-                    message=f"Page load took {page.duration_seconds:.2f}s",
-                    url=page.url,
-                    evidence=[self.evidence_for_url(page.url, note=f"{page.duration_seconds:.2f}s")],
-                )
-            )
-        if self._looks_like_js_error(page.html):
-            report.findings.append(
-                Finding(
-                    category="js_error",
-                    message="Potential JavaScript runtime error markers found in page source",
-                    url=page.url,
-                    evidence=[self.evidence_for_url(page.url, note="javascript error marker")],
-                )
-            )
-        if self._should_check_missing_element(page.url, page.text):
-            report.findings.append(
-                Finding(
-                    category="missing_element",
-                    message="Did not find expected content on page",
-                    url=page.url,
-                    evidence=[self.evidence_for_url(page.url, note="expected flow content missing")],
-                )
-            )
-
-    def _record_page_summary(self, report: TestReport, page: _PageResult, duplicate_of: str | None = None, parent_url: str | None = None) -> None:
-        report.page_summaries.append(
-            PageSummary(
-                url=page.url,
-                title=page.title,
-                status=page.status,
-                response_time_seconds=page.duration_seconds,
-                parent_url=parent_url,
-                duplicate_of=duplicate_of,
-            )
-        )
-
-    def _collect_link_findings(self, report: TestReport, source_page: _PageResult, linked_page: _PageResult) -> None:
-        if linked_page.error or (linked_page.status and linked_page.status >= 400):
-            report.findings.append(
-                Finding(
-                    category="broken_link",
-                    message=f"Broken link from {source_page.url} to {linked_page.url}",
-                    url=linked_page.url,
-                    evidence=[self.evidence_for_url(linked_page.url, note=linked_page.error or f"HTTP {linked_page.status}")],
-                )
-            )
-        if self._looks_like_api_failure(linked_page.url, linked_page.html, linked_page.status):
-            report.findings.append(
-                Finding(
-                    category="api_failure",
-                    message=f"API-like request failed for {linked_page.url}",
-                    url=linked_page.url,
-                    evidence=[self.evidence_for_url(linked_page.url, note=linked_page.error or f"HTTP {linked_page.status}")],
-                )
-            )
-
-    def _aggregate_counts(self, report: TestReport) -> None:
-        unique_findings = self._dedupe_findings(report.findings)
-        report.broken_links = 0
-        report.js_errors = 0
-        report.api_failures = 0
-        report.resource_failures = 0
-        report.third_party_failures = 0
-        report.navigation_failures = 0
-        report.missing_elements = 0
-        report.slow_pages = 0
-        report.unique_findings = unique_findings
-        for finding in report.findings:
-            if finding.category == "broken_link":
-                report.broken_links += 1
-            elif finding.category == "js_error":
-                report.js_errors += 1
-            elif finding.category == "api_failure":
-                report.api_failures += 1
-            elif finding.category == "resource_failure":
-                report.resource_failures += 1
-            elif finding.category == "third_party_failure":
-                report.third_party_failures += 1
-            elif finding.category == "navigation_failure":
-                report.navigation_failures += 1
-            elif finding.category == "missing_element":
-                report.missing_elements += 1
-            elif finding.category == "slow_page":
-                report.slow_pages += 1
-        report.score_breakdown, report.score_deductions = self._score_breakdown(report, unique_findings)
-        report.site_score, report.risk_level = self._score_report(report, unique_findings)
-        report.score_weights = self._score_weights()
-        report.phase2_summary = self._build_phase2_summary(report, unique_findings)
-        report.executive_summary = self._build_executive_summary(report, unique_findings)
-
-    def partial_report(self) -> TestReport | None:
-        """Return the report collected so far, finalized for persistence and display."""
-        if self.latest_report is not None:
-            self._aggregate_counts(self.latest_report)
-        return self.latest_report
-
-    @staticmethod
-    def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
-        seen: set[tuple[str, str | None, str]] = set()
-        unique: list[Finding] = []
-        for finding in findings:
-            fingerprint = (finding.category, Phase1Tester._strip_fragment(Phase1Tester._normalize_url_like(finding.url or "")), finding.message)
-            if fingerprint in seen:
-                continue
-            seen.add(fingerprint)
-            unique.append(finding)
-        return unique
-
-    @staticmethod
-    def _normalize_url_like(url: str) -> str:
-        if not url:
-            return url
-        parsed = urlparse(url)
-        path = parsed.path or "/"
-        if path != "/" and path.endswith("/"):
-            path = path.rstrip("/")
-        return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, parsed.query, ""))
-
-    @staticmethod
-    def _score_for_category(category: str) -> int:
-        return {
-            "navigation_failure": 25,
-            "js_error": 20,
-            "broken_link": 12,
-            "api_failure": 10,
-            "slow_page": 6,
-            "missing_element": 8,
-            "resource_failure": 3,
-            "third_party_failure": 1,
-        }.get(category, 2)
-
-    def _score_breakdown(self, report: TestReport, findings: list[Finding]) -> tuple[dict[str, int], dict[str, list[str]]]:
-        categories = {
-            "Functional Quality": 100,
-            "Performance": 100,
-            "Resource Health": 100,
-            "Navigation": 100,
-            "API Health": 100,
-        }
-        deductions: dict[str, list[str]] = {key: [] for key in categories}
-        seen_slow_pages: set[str] = set()
-        for finding in findings:
-            note = finding.message
-            if finding.category == "slow_page":
-                page_key = self._normalize_url_like(finding.url or "")
-                if page_key in seen_slow_pages:
-                    continue
-                seen_slow_pages.add(page_key)
-                categories["Performance"] -= 10
-                deductions["Performance"].append(f"-10 {note}")
-            elif finding.category == "resource_failure":
-                categories["Resource Health"] -= 10
-                deductions["Resource Health"].append(f"-10 {note}")
-            elif finding.category == "third_party_failure":
-                categories["Resource Health"] -= 5
-                deductions["Resource Health"].append(f"-5 {note}")
-            elif finding.category == "navigation_failure":
-                categories["Navigation"] -= 20
-                deductions["Navigation"].append(f"-20 {note}")
-            elif finding.category == "broken_link":
-                categories["Functional Quality"] -= 8
-                deductions["Functional Quality"].append(f"-8 {note}")
-            elif finding.category == "js_error":
-                categories["Functional Quality"] -= 15
-                deductions["Functional Quality"].append(f"-15 {note}")
-            elif finding.category == "api_failure":
-                categories["API Health"] -= 15
-                deductions["API Health"].append(f"-15 {note}")
-            elif finding.category == "missing_element":
-                categories["Functional Quality"] -= 5
-                deductions["Functional Quality"].append(f"-5 {note}")
-        if report.pages_tested:
-            for key in categories:
-                categories[key] = max(0, min(100, categories[key]))
-        return categories, deductions
-
-    def _score_report(self, report: TestReport, findings: list[Finding]) -> tuple[int, str]:
-        breakdown, _ = self._score_breakdown(report, findings)
-        weights = self._score_weights()
-        score = round(sum(breakdown[label] * weight for label, weight in weights.items()))
-        zero_categories = [label for label, value in breakdown.items() if value == 0]
-        categories = {finding.category for finding in findings}
-        if zero_categories:
-            if "Navigation" in zero_categories or "Functional Quality" in zero_categories:
-                return score, "Critical"
-            if "Performance" in zero_categories or "Resource Health" in zero_categories:
-                return score, "Moderate-High"
-        if "navigation_failure" in categories or "js_error" in categories:
-            if score >= 55:
-                level = "Moderate-High"
-            elif score >= 35:
-                level = "High"
-            else:
-                level = "Critical"
-            return score, level
-        if score >= 90:
-            level = "Low"
-        elif score >= 70:
-            level = "Moderate"
-        elif score >= 55:
-            level = "Moderate-High"
-        elif score >= 40:
-            level = "High"
-        else:
-            level = "Critical"
-        return score, level
-
-    @staticmethod
-    def _build_phase2_summary(report: TestReport, findings: list[Finding]) -> str:
-        unique_slow_pages = len(Phase1Tester._unique_slow_pages(findings))
-        return (
-            f"Site score: {report.site_score}/100 using weighted category scores. "
-            f"Risk level: {report.risk_level}. "
-            f"Unique findings: {len(findings)}. "
-            f"Deduplicated from {report.total_findings} total findings. "
-            f"Slow pages raw: {report.slow_pages}. "
-            f"Slow pages unique: {unique_slow_pages}."
-        )
-
-    @staticmethod
-    def _build_executive_summary(report: TestReport, findings: list[Finding]) -> str:
-        slow_pages = Phase1Tester._unique_slow_pages(findings)
-        strengths: list[str] = []
-        weaknesses: list[str] = []
-        if report.broken_links == 0:
-            strengths.append("No broken links")
-        if report.navigation_failures == 0:
-            strengths.append("Navigation is healthy")
-        if report.api_failures == 0:
-            strengths.append("APIs are healthy")
-        if report.navigation_failures:
-            weaknesses.append("Navigation issue found")
-        if slow_pages:
-            weaknesses.append(f"{len(slow_pages)} unique slow pages")
-        if report.resource_failures:
-            weaknesses.append(f"{report.resource_failures} resource issues")
-        if report.js_errors:
-            weaknesses.append(f"{report.js_errors} JavaScript errors")
-        recommendation_parts = []
-        if slow_pages:
-            top_slow_pages = ", ".join(
-                f"Priority {index + 1}: {page_label} ({duration:.2f}s)"
-                for index, (page_label, duration) in enumerate(slow_pages[:3])
-            )
-            recommendation_parts.append(f"Optimize slow pages first: {top_slow_pages}")
-        if report.resource_failures:
-            recommendation_parts.append("Fix missing resources and banners")
-        if report.js_errors:
-            recommendation_parts.append("Resolve runtime errors")
-        if not recommendation_parts:
-            recommendation_parts.append("Continue monitoring the site")
-        lines = [
-            "Website Health Summary",
-            f"Overall Score: {report.site_score}/100",
-            f"Risk: {report.risk_level}",
-        ]
-        if strengths:
-            lines.append("Strengths: " + "; ".join(strengths))
-        if weaknesses:
-            lines.append("Weaknesses: " + "; ".join(weaknesses))
-        lines.append("Recommendation: " + "; ".join(recommendation_parts))
-        return "\n".join(lines)
-
-    @staticmethod
-    def _score_weights() -> dict[str, float]:
-        return {
-            "Functional Quality": 0.40,
-            "Performance": 0.25,
-            "Navigation": 0.15,
-            "Resource Health": 0.10,
-            "API Health": 0.10,
-        }
-
-    @staticmethod
-    def _unique_slow_pages(findings: list[Finding]) -> list[tuple[str, float]]:
-        unique: dict[str, tuple[str, float]] = {}
-        for finding in findings:
-            if finding.category != "slow_page" or not finding.url:
-                continue
-            canonical = Phase1Tester._normalize_url_like(finding.url)
-            duration = Phase1Tester._extract_duration(finding.message)
-            current = unique.get(canonical)
-            if current is None or duration > current[1]:
-                unique[canonical] = (Phase1Tester._friendly_page_label_from_url(finding.url), duration)
-        return sorted(unique.values(), key=lambda item: item[1], reverse=True)
-
-    @staticmethod
-    def _extract_duration(message: str) -> float:
-        import re
-
-        match = re.search(r"(\d+(?:\.\d+)?)s", message)
-        return float(match.group(1)) if match else 0.0
-
-    @staticmethod
-    def _friendly_page_label_from_url(url: str) -> str:
-        parsed = urlparse(url)
-        path = parsed.path.strip("/")
-        if not path:
-            return "Home"
-        tail = path.rsplit("/", 1)[-1]
-        words = [part for part in tail.replace("-", " ").replace("_", " ").split() if part]
-        if not words:
-            return "Page"
-        return " ".join(word.capitalize() for word in words)
-
     @staticmethod
     def _canonicalize_url(url: str) -> str:
         parsed = urlparse(url)
@@ -1527,19 +1683,78 @@ class Phase1Tester:
             kept_query.append((key, value))
         return urlunparse((parsed.scheme, parsed.netloc, path, "", urlencode(kept_query, doseq=True), ""))
 
+    @staticmethod
+    def _url_terms(url: str) -> set[str]:
+        parsed = urlparse(url)
+        normalized = f"{parsed.path} {parsed.query}".lower().replace("-", "/").replace("_", "/")
+        normalized = normalized.replace("?", "/").replace("&", "/").replace("=", "/")
+        return {part.strip() for part in normalized.replace(" ", "/").split("/") if part.strip()}
+
+    @classmethod
+    def _link_priority_tier(cls, url: str) -> int:
+        terms = cls._url_terms(url)
+        path = urlparse(url).path.lower().replace("-", "/").replace("_", "/")
+        path_parts = {part for part in path.split("/") if part}
+        product_path = bool(path_parts & {"dp", "p", "pr", "item", "items"})
+        search_or_journey_path = bool(path_parts & {"search", "cart", "basket", "bag", "checkout", "deal", "deals", "offer", "offers"})
+        legal_or_special_path = any(
+            marker in path
+            for marker in (
+                "privacy", "terms", "condition", "legal", "policy", "sitemap",
+                "payment", "shipping", "cancellation", "refund", "gift",
+                "flight", "travel", "mobile/apps", "corporate", "compliance",
+                "security", "searchsuggestion",
+            )
+        )
+        if product_path or search_or_journey_path or terms & (HIGH_PRIORITY_LINK_TERMS - {"search"}):
+            return 0
+        if terms & (LEGAL_FOOTER_LINK_TERMS | SPECIAL_SERVICE_LINK_TERMS) or legal_or_special_path or cls._is_low_priority_noise_url(url):
+            return 3
+        if terms & SUPPORT_LINK_TERMS:
+            return 2
+        if terms & CONTENT_LINK_TERMS:
+            return 2
+        if "search" in terms:
+            return 0
+        if terms & UTILITY_LINK_TERMS:
+            return 3
+        return 1
+
+    @staticmethod
+    def _is_low_priority_noise_url(url: str) -> bool:
+        parsed = urlparse(url)
+        normalized_path = parsed.path.lower().replace("-", "/").replace("_", "/")
+        noise_tokens = (
+            "footer", "wishlist", "safety", "alert", "auto/deliver", "/r", "create/invitation",
+            "business", "gift/card", "shop/info", "flights", "flight", "travel", "outlet", "discover", "showroom",
+            "corporate", "helpcentre", "help/centre", "sitemap", "mobile/apps", "pages/payments",
+            "searchsuggestion", "cancellation", "shipping", "security", "compliance", "privacy",
+        )
+        useful_tokens = ("cart", "product", "deal", "offer", "search", "/s", "/dp", "/p/", "/pr", "bestseller", "category")
+        return any(token in normalized_path for token in noise_tokens) and not any(token in normalized_path for token in useful_tokens)
+
     def _is_candidate_page_url(self, url: str, base_url: str) -> bool:
         if not self._is_http_url(url) or not self._is_crawlable_page(url):
             return False
         parsed = urlparse(url)
         if parsed.netloc != urlparse(base_url).netloc:
             return False
-        path_parts = {part.lower() for part in parsed.path.replace("-", "/").replace("_", "/").split("/") if part}
+        normalized_path = parsed.path.lower().replace("-", "/").replace("_", "/")
+        path_parts = {part.lower() for part in normalized_path.split("/") if part}
+        if normalized_path.rstrip("/").endswith("/searchsuggestion"):
+            return False
+        if self._is_low_priority_noise_url(url):
+            return False
         if path_parts & LOW_VALUE_PATH_PARTS:
+            return False
+        if path_parts & LOW_VALUE_LINK_PATH_PARTS and not (path_parts & HIGH_VALUE_PATH_PARTS):
             return False
         if path_parts & AUTH_PATH_PARTS:
             return False
         query_keys = {key.lower() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
         if query_keys and query_keys <= LOW_VALUE_QUERY_KEYS:
+            return False
+        if parsed.path.rstrip("/").lower().endswith("/get"):
             return False
         canonical = self._canonicalize_url(url)
         canonical_query_keys = {key.lower() for key, _ in parse_qsl(urlparse(canonical).query, keep_blank_values=True)}
@@ -1554,13 +1769,21 @@ class Phase1Tester:
             unique.setdefault(self._duplicate_key(canonical), canonical)
         parent_section = self._top_section(parent_url) if parent_url else "__root__"
 
-        def score(url: str) -> tuple[int, int, str]:
+        def score(url: str) -> tuple[int, int, int, str]:
             parsed = urlparse(url)
-            path_parts = {part.lower() for part in parsed.path.split("/") if part}
+            path_parts = {part.lower() for part in parsed.path.replace("-", "/").replace("_", "/").split("/") if part}
             section = self._top_section(url)
-            value = 0
-            if path_parts & HIGH_VALUE_PATH_PARTS:
+            tier = self._link_priority_tier(url)
+            value = tier * 100
+            if tier == 0 and path_parts & HIGH_VALUE_PATH_PARTS:
                 value -= 20
+            terms = self._url_terms(url)
+            if terms & SUPPORT_LINK_TERMS:
+                value += 35
+            if terms & CONTENT_LINK_TERMS:
+                value += 45
+            if terms & (LEGAL_FOOTER_LINK_TERMS | SPECIAL_SERVICE_LINK_TERMS):
+                value += 80
             if parent_section != "__root__" and section == parent_section:
                 value -= 10
             elif parent_section != "__root__" and section != parent_section:
@@ -1568,7 +1791,7 @@ class Phase1Tester:
             if parsed.query:
                 value += 6
             depth = len(path_parts)
-            return (value, depth, url)
+            return (value, depth, len(url), url)
 
         return sorted(unique.values(), key=score)
 
@@ -1676,7 +1899,8 @@ class Phase1Tester:
                 continue
             text = str(action.get("text") or "").strip()
             href = str(action.get("href") or "").strip()
-            items.append(Phase1Tester._link_label(href, text))
+            area = str(action.get("area") or "other").strip() or "other"
+            items.append(f"{Phase1Tester._link_label(href, text)} [{area}]")
         if len(actions) > limit:
             items.append(f"... (+{len(actions) - limit} more)")
         return " | ".join(items) if items else "(none)"
